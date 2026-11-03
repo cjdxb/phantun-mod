@@ -2,7 +2,9 @@ use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::Stack;
 use log::{debug, error, info};
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
+use phantun::firewall::{Firewall, Nat};
+use phantun::http;
+use phantun::utils::{assign_ipv6_address, new_udp_reuseport, shutdown_signal};
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
@@ -101,6 +103,32 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("iface")
+                .long("iface")
+                .required(false)
+                .value_name("IFACE")
+                .help("Sets the Internet facing interface. When set, Phantun Server enables IP forwarding \
+                       and adds the required DNAT rules on startup, and removes the rules on exit")
+        )
+        .arg(
+            Arg::new("fw_backend")
+                .long("fw-backend")
+                .required(false)
+                .value_name("BACKEND")
+                .help("Firewall backend used by --iface, \"auto\" uses nft when available")
+                .value_parser(["auto", "nft", "iptables"])
+                .default_value("auto")
+                .requires("iface")
+        )
+        .arg(
+            Arg::new("http_handshake")
+                .long("http-handshake")
+                .required(false)
+                .help("Answer the HTTP request sent by a Phantun Client started with --http-handshake \
+                       with an HTTP response, instead of forwarding it as UDP")
+                .action(ArgAction::SetTrue)
+        )
         .get_matches();
 
     let local_port: u16 = matches
@@ -146,6 +174,7 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let http_handshake = matches.get_flag("http_handshake");
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -164,6 +193,23 @@ async fn main() -> io::Result<()> {
     }
 
     info!("Created TUN device {}", tun[0].name());
+
+    let _firewall = matches
+        .get_one::<String>("iface")
+        .map(|iface| {
+            Firewall::setup(
+                matches.get_one::<String>("fw_backend").unwrap(),
+                iface,
+                tun[0].name(),
+                Nat::Dnat {
+                    port: local_port,
+                    peer: tun_peer,
+                    peer6: tun_peer6,
+                },
+            )
+        })
+        .transpose()
+        .map_err(io::Error::other)?;
 
     //thread::sleep(time::Duration::from_secs(5));
     let mut stack = Stack::new(tun, tun_local, tun_local6);
@@ -219,6 +265,16 @@ async fn main() -> io::Result<()> {
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
                                     Some(size) => {
+                                        // HTTP handshake (or its retransmission) from client
+                                        if http_handshake && http::is_request(&buf_tcp[..size]) {
+                                            if sock.send(http::RESPONSE).await.is_none() {
+                                                quit.cancel();
+                                                return;
+                                            }
+
+                                            continue;
+                                        }
+
                                         if size > 0
                                             && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
@@ -262,5 +318,11 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    tokio::join!(main_loop).0.unwrap()
+    tokio::select! {
+        res = main_loop => res.unwrap(),
+        _ = shutdown_signal() => {
+            info!("Received shutdown signal, exiting");
+            Ok(())
+        },
+    }
 }

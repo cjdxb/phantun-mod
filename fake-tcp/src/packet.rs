@@ -39,6 +39,19 @@ pub fn build_tcp_packet(
     flags: u8,
     payload: Option<&[u8]>,
 ) -> Bytes {
+    build_tcp_packet_with_ttl(local_addr, remote_addr, seq, ack, flags, payload, 64)
+}
+
+/// Same as [`build_tcp_packet`], but with the IPv4 TTL / IPv6 hop limit set to `ttl`.
+pub fn build_tcp_packet_with_ttl(
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: Option<&[u8]>,
+    ttl: u8,
+) -> Bytes {
     let ip_header_len = match local_addr {
         SocketAddr::V4(_) => IPV4_HEADER_LEN,
         SocketAddr::V6(_) => IPV6_HEADER_LEN,
@@ -59,7 +72,7 @@ pub fn build_tcp_packet(
             v4.set_version(4);
             v4.set_header_length(IPV4_HEADER_LEN as u8 / 4);
             v4.set_next_level_protocol(ip::IpNextHeaderProtocols::Tcp);
-            v4.set_ttl(64);
+            v4.set_ttl(ttl);
             v4.set_source(*local.ip());
             v4.set_destination(*remote.ip());
             v4.set_total_length(total_len.try_into().unwrap());
@@ -73,7 +86,7 @@ pub fn build_tcp_packet(
             v6.set_version(6);
             v6.set_payload_length(tcp_total_len.try_into().unwrap());
             v6.set_next_header(ip::IpNextHeaderProtocols::Tcp);
-            v6.set_hop_limit(64);
+            v6.set_hop_limit(ttl);
             v6.set_source(*local.ip());
             v6.set_destination(*remote.ip());
         }

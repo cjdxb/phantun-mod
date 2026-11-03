@@ -255,6 +255,47 @@ RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote exam
 
 [Back to TOC](#table-of-contents)
 
+### Automatic firewall rules
+
+Instead of following steps 1 and 2 manually, pass the Internet facing interface with `--iface`.
+Phantun then enables IP forwarding, adds the required MASQUERADE (client) or DNAT (server) rules
+on startup, and removes them when it exits on `SIGINT`/`SIGTERM`. Rules left behind by a killed
+process are replaced on the next start. Running as root is required for this option.
+
+```
+RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote 127.0.0.1:1234 --iface eth0
+RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --iface eth0
+```
+
+nft is used when available (rules live in their own `inet phantun_<tun>` table), otherwise
+iptables/ip6tables (rules tagged with comment `phantun_<tun>`). Use `--fw-backend nft|iptables`
+to force one. Note that with the nft backend, `FORWARD` drop rules managed by other tools
+(e.g. Docker via iptables) are not overridden; use `--fw-backend iptables` in that case.
+
+[Back to TOC](#table-of-contents)
+
+### HTTP obfuscation
+
+Two independent options make the fake TCP connection look like HTTP:
+
+* `--fake-http` (client only): after receiving SYN + ACK, the client sends `--fake-repeat`
+  HTTP request decoys whose TTL lets them survive only `--fake-ttl` hops, so middleboxes on the
+  path see an HTTP request. Decoys that do reach the server are ignored during the handshake, so
+  `--fake-ttl` only needs to exceed the hop at which inspection happens. Keeping it below the hop
+  count to the server avoids a rare case where a reordered decoy arrives after the handshake and
+  gets forwarded as a junk UDP datagram.
+* `--http-handshake` (both sides): after TCP handshake, the client sends a real HTTP request and
+  waits for the server's HTTP response before forwarding any UDP traffic. Both packets are consumed
+  by Phantun and never forwarded.
+
+```
+RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote 127.0.0.1:1234 --http-handshake
+RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 \
+    --http-host www.example.com --fake-http --http-handshake
+```
+
+[Back to TOC](#table-of-contents)
+
 # MTU overhead
 
 Phantun aims to keep tunneling overhead to the minimum. The overhead compared to a plain UDP packet

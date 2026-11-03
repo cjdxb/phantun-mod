@@ -2,7 +2,9 @@ use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
+use phantun::firewall::{Firewall, Nat};
+use phantun::http;
+use phantun::utils::{assign_ipv6_address, new_udp_reuseport, shutdown_signal, udp_recv_pktinfo};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -101,6 +103,67 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("iface")
+                .long("iface")
+                .required(false)
+                .value_name("IFACE")
+                .help("Sets the Internet facing interface. When set, Phantun Client enables IP forwarding \
+                       and adds the required MASQUERADE rules on startup, and removes the rules on exit")
+        )
+        .arg(
+            Arg::new("fw_backend")
+                .long("fw-backend")
+                .required(false)
+                .value_name("BACKEND")
+                .help("Firewall backend used by --iface, \"auto\" uses nft when available")
+                .value_parser(["auto", "nft", "iptables"])
+                .default_value("auto")
+                .requires("iface")
+        )
+        .arg(
+            Arg::new("http_host")
+                .long("http-host")
+                .required(false)
+                .value_name("HOST")
+                .help("Sets the Host header used by --fake-http and --http-handshake")
+        )
+        .arg(
+            Arg::new("fake_http")
+                .long("fake-http")
+                .required(false)
+                .help("After receiving SYN + ACK, send HTTP request decoys with a limited TTL, \
+                       so middleboxes on the path see an HTTP connection. Decoys reaching the server are ignored")
+                .action(ArgAction::SetTrue)
+                .requires("http_host")
+        )
+        .arg(
+            Arg::new("fake_ttl")
+                .long("fake-ttl")
+                .required(false)
+                .value_name("TTL")
+                .help("Number of hops the --fake-http decoys survive after leaving this host")
+                .value_parser(clap::value_parser!(u8).range(1..255))
+                .default_value("3")
+        )
+        .arg(
+            Arg::new("fake_repeat")
+                .long("fake-repeat")
+                .required(false)
+                .value_name("N")
+                .help("Number of --fake-http decoys sent per connection")
+                .value_parser(clap::value_parser!(usize))
+                .default_value("2")
+        )
+        .arg(
+            Arg::new("http_handshake")
+                .long("http-handshake")
+                .required(false)
+                .help("After TCP handshake, exchange a real HTTP request/response with the server \
+                       before forwarding any UDP traffic. The server must also be started with --http-handshake")
+                .action(ArgAction::SetTrue)
+                .requires("http_host")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -147,6 +210,10 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let http_request = matches
+        .get_one::<String>("http_host")
+        .map(|host| http::request(host));
+    let http_handshake = matches.get_flag("http_handshake");
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -166,10 +233,35 @@ async fn main() -> io::Result<()> {
 
     info!("Created TUN device {}", tun[0].name());
 
+    let _firewall = matches
+        .get_one::<String>("iface")
+        .map(|iface| {
+            Firewall::setup(
+                matches.get_one::<String>("fw_backend").unwrap(),
+                iface,
+                tun[0].name(),
+                Nat::Masquerade {
+                    peer: tun_peer,
+                    peer6: tun_peer6.filter(|_| remote_addr.is_ipv6()),
+                },
+            )
+        })
+        .transpose()
+        .map_err(io::Error::other)?;
+
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
     let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
 
     let mut stack = Stack::new(tun, tun_peer, tun_peer6);
+    if matches.get_flag("fake_http") {
+        stack.set_fake_packet(
+            http_request.as_ref().unwrap(),
+            // +1 because packets coming out of the Tun interface are forwarded
+            // by the kernel, which decrements TTL once before they leave this host
+            matches.get_one::<u8>("fake_ttl").unwrap() + 1,
+            *matches.get_one::<usize>("fake_repeat").unwrap(),
+        );
+    }
 
     let main_loop = tokio::spawn(async move {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
@@ -193,6 +285,15 @@ async fn main() -> io::Result<()> {
             }
 
             let sock = Arc::new(sock.unwrap());
+            if http_handshake {
+                if !http::client_handshake(&sock, http_request.as_ref().unwrap()).await {
+                    error!("HTTP handshake with {} failed, closing connection.", sock);
+                    continue;
+                }
+
+                debug!("HTTP handshake with {} done", sock);
+            }
+
             if let Some(ref p) = handshake_packet {
                 if sock.send(p).await.is_none() {
                     error!("Failed to send handshake packet to remote, closing connection.");
@@ -271,6 +372,11 @@ async fn main() -> io::Result<()> {
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
                                     Some(size) => {
+                                        // late duplicate of the HTTP handshake response
+                                        if http_handshake && http::is_response(&buf_tcp[..size]) {
+                                            continue;
+                                        }
+
                                         if size > 0
                                             && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
@@ -323,5 +429,11 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    tokio::join!(main_loop).0.unwrap()
+    tokio::select! {
+        res = main_loop => res.unwrap(),
+        _ = shutdown_signal() => {
+            info!("Received shutdown signal, exiting");
+            Ok(())
+        },
+    }
 }
