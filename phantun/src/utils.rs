@@ -150,6 +150,18 @@ pub fn assign_ipv6_address(device_name: &str, local: Ipv6Addr, peer: Ipv6Addr) {
     rtnl.send(&nl_header).unwrap();
 }
 
+/// Resolves on SIGINT or SIGTERM, so that `main` can return normally and
+/// run destructors such as [`crate::firewall::Firewall`]'s rule cleanup.
+pub async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = signal(SignalKind::terminate()).unwrap();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = sigterm.recv() => {},
+    }
+}
+
 const fn max_usize(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }

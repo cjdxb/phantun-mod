@@ -88,11 +88,18 @@ struct Shared {
     tuples_purge: broadcast::Sender<AddrTuple>,
 }
 
+struct FakePacket {
+    payload: Bytes,
+    ttl: u8,
+    repeat: usize,
+}
+
 pub struct Stack {
     shared: Arc<Shared>,
     local_ip: Ipv4Addr,
     local_ip6: Option<Ipv6Addr>,
     ready: mpsc::Receiver<Socket>,
+    fake: Option<FakePacket>,
 }
 
 pub enum State {
@@ -267,7 +274,7 @@ impl Socket {
         }
     }
 
-    async fn connect(&mut self) -> Option<()> {
+    async fn connect(&mut self, fake: Option<&FakePacket>) -> Option<()> {
         for _ in 0..RETRIES {
             match self.state {
                 State::Idle => {
@@ -294,6 +301,24 @@ impl Socket {
                                 self.seq.fetch_add(1, Ordering::Relaxed);
                                 self.ack
                                     .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
+
+                                // send decoys before the handshake ACK, they do not
+                                // advance seq so later data overlaps them
+                                if let Some(fake) = fake {
+                                    let buf = build_tcp_packet_with_ttl(
+                                        self.local_addr,
+                                        self.remote_addr,
+                                        self.seq.load(Ordering::Relaxed),
+                                        self.ack.load(Ordering::Relaxed),
+                                        tcp::TcpFlags::PSH | tcp::TcpFlags::ACK,
+                                        Some(&fake.payload),
+                                        fake.ttl,
+                                    );
+                                    for _ in 0..fake.repeat {
+                                        self.tun.send(&buf).await.unwrap();
+                                    }
+                                    trace!("Sent {} fake packet(s) to server", fake.repeat);
+                                }
 
                                 // send ACK to finish handshake
                                 let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
@@ -325,8 +350,9 @@ impl Drop for Socket {
         let tuple = AddrTuple::new(self.local_addr, self.remote_addr);
         // dissociates ourself from the dispatch map
         assert!(self.shared.tuples.write().unwrap().remove(&tuple).is_some());
-        // purge cache
-        self.shared.tuples_purge.send(tuple).unwrap();
+        // purge cache, fails only when no reader task is left (runtime shutting
+        // down), in which case there is no cache to purge
+        let _ = self.shared.tuples_purge.send(tuple);
 
         let buf = build_tcp_packet(
             self.local_addr,
@@ -386,7 +412,20 @@ impl Stack {
             local_ip,
             local_ip6,
             ready: ready_rx,
+            fake: None,
         }
+    }
+
+    /// Makes every subsequent [`Stack::connect`] send `repeat` copies of `payload`
+    /// with IPv4 TTL / IPv6 hop limit `ttl` right after receiving SYN + ACK.
+    /// These decoys do not advance the sequence number, so a `ttl` low enough
+    /// to expire before reaching the server leaves the connection unaffected.
+    pub fn set_fake_packet(&mut self, payload: &[u8], ttl: u8, repeat: usize) {
+        self.fake = Some(FakePacket {
+            payload: Bytes::copy_from_slice(payload),
+            ttl,
+            repeat,
+        });
     }
 
     /// Listens for incoming connections on the given `port`.
@@ -438,7 +477,7 @@ impl Stack {
                 assert!(tuples.insert(tuple, incoming).is_none());
             }
 
-            return sock.connect().await.map(|_| sock);
+            return sock.connect(self.fake.as_ref()).await.map(|_| sock);
         }
 
         error!(
