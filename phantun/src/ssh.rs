@@ -13,6 +13,7 @@
 
 use fake_tcp::Socket;
 use fake_tcp::packet::MAX_PACKET_LEN;
+use log::info;
 use rand::Rng;
 use tokio::time;
 
@@ -61,6 +62,11 @@ const COMPRESSION: &str = "none,zlib@openssh.com";
 
 pub fn is_identification(buf: &[u8]) -> bool {
     buf == IDENTIFICATION
+}
+
+/// The identification string without its CRLF, for logging.
+pub fn identification_line() -> &'static str {
+    std::str::from_utf8(IDENTIFICATION).unwrap().trim_end()
 }
 
 /// Builds an unencrypted `SSH_MSG_KEXINIT` binary packet with a fresh random
@@ -142,10 +148,17 @@ pub async fn client_handshake(sock: &Socket) -> bool {
     let mut got_identification = false;
     let mut got_kexinit = false;
 
-    for _ in 0..RETRIES {
+    for attempt in 1..=RETRIES {
         if sock.send(IDENTIFICATION).await.is_none() {
             return false;
         }
+        info!(
+            "SSH -> {}: identification \"{}\" (attempt {}/{})",
+            sock,
+            identification_line(),
+            attempt,
+            RETRIES
+        );
 
         let deadline = time::Instant::now() + TIMEOUT;
         loop {
@@ -153,13 +166,16 @@ pub async fn client_handshake(sock: &Socket) -> bool {
                 Ok(Some(size)) => {
                     let segment = &buf[..size];
                     if is_identification(segment) {
+                        info!("SSH <- {}: identification \"{}\"", sock, identification_line());
                         if !got_identification {
                             got_identification = true;
                             if sock.send(&kexinit).await.is_none() {
                                 return false;
                             }
+                            info!("SSH -> {}: KEXINIT ({} bytes)", sock, kexinit.len());
                         }
                     } else if is_kexinit(segment) {
+                        info!("SSH <- {}: KEXINIT ({} bytes)", sock, size);
                         got_kexinit = true;
                     }
 

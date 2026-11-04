@@ -273,6 +273,9 @@ async fn run(firewall: &mut Option<Firewall>) -> io::Result<()> {
                 error!("Failed to send SSH identification to remote, closing connection.");
                 continue;
             }
+            if ssh_handshake {
+                info!("SSH -> {}: identification \"{}\"", sock, ssh::identification_line());
+            }
             // With an application handshake the client discards every segment
             // until the response arrives, so this packet is sent by the worker afterwards.
             if !http_handshake && !ssh_handshake {
@@ -330,6 +333,7 @@ async fn run(firewall: &mut Option<Firewall>) -> io::Result<()> {
                                         // the client's KEXINIT (or a copy of it) carries
                                         // nothing we need, whenever it arrives
                                         if ssh_handshake && ssh::is_kexinit(&buf_tcp[..size]) {
+                                            info!("SSH <- {}: KEXINIT ({} bytes)", sock, size);
                                             continue;
                                         }
 
@@ -349,8 +353,22 @@ async fn run(firewall: &mut Option<Firewall>) -> io::Result<()> {
                                             // either, so it gets both again.
                                             let first = !handshake_done.swap(true, Ordering::Relaxed);
                                             let sent = if ssh_hello {
-                                                (first || sock.send(ssh::IDENTIFICATION).await.is_some())
-                                                    && sock.send(ssh_kexinit.as_deref().unwrap()).await.is_some()
+                                                let kexinit = ssh_kexinit.as_deref().unwrap();
+                                                info!(
+                                                    "SSH <- {}: identification \"{}\"{}",
+                                                    sock,
+                                                    ssh::identification_line(),
+                                                    if first { "" } else { " (retransmission)" }
+                                                );
+                                                let resent_id = !first && sock.send(ssh::IDENTIFICATION).await.is_some();
+                                                if resent_id {
+                                                    info!("SSH -> {}: identification \"{}\" (again)", sock, ssh::identification_line());
+                                                }
+                                                let ok = (first || resent_id) && sock.send(kexinit).await.is_some();
+                                                if ok {
+                                                    info!("SSH -> {}: KEXINIT ({} bytes)", sock, kexinit.len());
+                                                }
+                                                ok
                                             } else {
                                                 sock.send(http::RESPONSE).await.is_some()
                                             };
