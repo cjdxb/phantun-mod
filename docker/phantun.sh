@@ -54,7 +54,7 @@ _check_rule6_by_comment() {
 }
 
 _is_server_mode() {
-  [ "$1" = "phantun-server" ]
+  [ "$1" = "phantun_server" ]
 }
 
 _is_ipv4_only() {
@@ -156,7 +156,7 @@ apply_ip6tables() {
 }
 
 stop_process() {
-  kill $(pidof phantun-server phantun-client)
+  kill $(pidof phantun_server phantun_client)
   info "terminate phantun process."
 }
 
