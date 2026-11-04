@@ -159,6 +159,15 @@ impl Socket {
         )
     }
 
+    /// Largest payload whose IP packet still fits in [`MAX_PACKET_LEN`],
+    /// which is all the receiving end reads from its Tun interface.
+    pub fn max_payload_len(&self) -> usize {
+        match self.remote_addr {
+            SocketAddr::V4(_) => MAX_PACKET_LEN - 20 - 20,
+            SocketAddr::V6(_) => MAX_PACKET_LEN - 40 - 20,
+        }
+    }
+
     fn build_tcp_packet(&self, flags: u8, payload: Option<&[u8]>) -> Bytes {
         let ack = self.ack.load(Ordering::Relaxed);
         self.last_ack.store(ack, Ordering::Relaxed);
@@ -362,7 +371,10 @@ impl Socket {
                                     for _ in 0..fake.repeat {
                                         self.tun.send(&buf).await.unwrap();
                                     }
-                                    trace!("Sent {} fake packet(s) to server", fake.repeat);
+                                    info!(
+                                        "Sent {} fake HTTP packet(s) to {}",
+                                        fake.repeat, self.remote_addr
+                                    );
                                 }
 
                                 // send ACK to finish handshake
