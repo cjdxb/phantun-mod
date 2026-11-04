@@ -165,7 +165,8 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 1. 把 `/proc/sys/net/ipv4/ip_forward` 置为 1（使用 IPv6 时还会设置 `net.ipv6.conf.all.forwarding`）；
 2. 添加 NAT 规则：
     * 客户端：从 TUN 进、从 `--iface` 出的流量做 MASQUERADE；
-    * 服务端：从 `--iface` 进、目标端口为 `--local` 的 TCP 流量 DNAT 到 `--tun-peer`（及 `--tun-peer6`）。
+    * 服务端：从 `--iface` 进、目标端口为 `--local` 的 TCP 流量 DNAT 到 `--tun-peer`（及 `--tun-peer6`）；
+3. 添加丢弃规则，防止无法 NAT 的包（例如连接重置时 conntrack 条目已失效的 RST）带着 TUN 地址从 `--iface` 发出。
 
 收到 `SIGINT` / `SIGTERM` 退出时删除这些规则（IP 转发开关保持不变）。如果进程被 `kill -9` 等方式强杀导致规则残留，
 下次启动时会先清理旧规则再添加，不会重复。
@@ -406,7 +407,9 @@ With `--iface`, Phantun does the following on startup:
 2. Adds NAT rules:
     * Client: MASQUERADE traffic coming from the TUN interface and leaving through `--iface`;
     * Server: DNAT TCP traffic arriving on `--iface` with destination port `--local` to `--tun-peer`
-      (and `--tun-peer6`).
+      (and `--tun-peer6`);
+3. Adds drop rules so packets NAT cannot translate (e.g. a RST sent after its conntrack entry is
+   gone) never leave `--iface` with the TUN address as source.
 
 The rules are removed when Phantun exits on `SIGINT` / `SIGTERM` (IP forwarding is left on). If the
 process was killed (e.g. `kill -9`) and left rules behind, they are cleaned up on the next start

@@ -90,6 +90,23 @@ impl Firewall {
     }
 
     fn setup_nft(&mut self, iface: &str, tun: &str, nat: &Nat) -> Result<(), String> {
+        let (peer, peer6) = match nat {
+            Nat::Masquerade { peer, peer6 } | Nat::Dnat { peer, peer6, .. } => (peer, peer6),
+        };
+        // Packets that conntrack considers INVALID (e.g. a RST sent after the
+        // connection's entry was flushed by an address change) skip NAT and
+        // would leave `iface` with the Tun address as source. Runs after NAT,
+        // so anything still carrying the Tun peer address is such a packet.
+        let mut leak = format!(
+            "    chain leak {{\n\
+             \x20       type filter hook postrouting priority srcnat + 1; policy accept;\n\
+             \x20       oifname \"{iface}\" ip saddr {peer} drop\n"
+        );
+        if let Some(peer6) = peer6 {
+            leak += &format!("        oifname \"{iface}\" ip6 saddr {peer6} drop\n");
+        }
+        leak += "    }\n";
+
         let chain = match nat {
             Nat::Masquerade { .. } => format!(
                 "    chain postrouting {{\n\
@@ -114,7 +131,7 @@ impl Firewall {
         // declaring then deleting the table first atomically removes leftovers
         // from a previous run that was killed without cleaning up
         let script = format!(
-            "table inet {name}\ndelete table inet {name}\ntable inet {name} {{\n{chain}}}\n",
+            "table inet {name}\ndelete table inet {name}\ntable inet {name} {{\n{chain}{leak}}}\n",
             name = self.name
         );
 
@@ -148,6 +165,26 @@ impl Firewall {
                     format!("-p tcp -i {iface} --dport {port} -j DNAT --to-destination {peer}"),
                 ),
             });
+            // iptables has no hook after NAT, so drop what NAT cannot translate
+            // instead: INVALID packets skip NAT entirely (e.g. a RST after the
+            // conntrack entry was flushed), and on the server a connection
+            // started from the Tun side has no DNAT to reverse. Inserted last
+            // so they end up above the ACCEPT rules.
+            let leak = format!("-i {tun} -o {iface} -m conntrack");
+            rules.push((
+                cmd,
+                "filter",
+                "FORWARD",
+                format!("{leak} --ctstate INVALID -j DROP"),
+            ));
+            if let Nat::Dnat { .. } = nat {
+                rules.push((
+                    cmd,
+                    "filter",
+                    "FORWARD",
+                    format!("{leak} --ctdir ORIGINAL -j DROP"),
+                ));
+            }
         }
 
         for (cmd, table, chain, spec) in rules {

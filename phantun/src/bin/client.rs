@@ -19,8 +19,18 @@ use tokio_util::sync::CancellationToken;
 use phantun::{KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_PROBES, UDP_TTL};
 use rand::Rng;
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
+    let mut firewall = None;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let res = runtime.block_on(run(&mut firewall));
+    // dropping the runtime drops the tasks owning fake TCP sockets, which send
+    // RSTs; do it while the firewall rules that NAT those RSTs still exist
+    drop(runtime);
+    drop(firewall);
+    res
+}
+
+async fn run(firewall: &mut Option<Firewall>) -> io::Result<()> {
     pretty_env_logger::init();
 
     let matches = Command::new("Phantun Client")
@@ -273,7 +283,7 @@ async fn main() -> io::Result<()> {
 
     info!("Created TUN device {}", tun[0].name());
 
-    let _firewall = matches
+    *firewall = matches
         .get_one::<String>("iface")
         .map(|iface| {
             Firewall::setup(
