@@ -4,10 +4,9 @@ Client/Server crate, see [Phantun Project README.md](https://github.com/dndx/pha
 
 ## License
 
-Copyright 2021-2025 Datong Sun <dndx@idndx.com>
+Copyright 2021-2025 Datong Sun <dndx@idndx.com>  
+Copyright 2026 cjdxb
 
-Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-[https://www.apache.org/licenses/LICENSE-2.0](https://www.apache.org/licenses/LICENSE-2.0)> or the MIT license
-<LICENSE-MIT or [https://opensource.org/licenses/MIT](https://opensource.org/licenses/MIT)>, at your
-option. Files in the project may not be
-copied, modified, or distributed except according to those terms.
+Licensed under the MIT license <[LICENSE-MIT](LICENSE-MIT) or
+[https://opensource.org/licenses/MIT](https://opensource.org/licenses/MIT)>.
+Files in the project may not be copied, modified, or distributed except according to those terms.
