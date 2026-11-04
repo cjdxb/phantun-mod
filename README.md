@@ -26,6 +26,7 @@ A lightweight and fast UDP to TCP obfuscator. / 轻量、高速的 UDP 转 TCP �
         * [启动客户端](#启动客户端)
     * [自动管理防火墙规则](#自动管理防火墙规则)
     * [HTTP 混淆](#http-混淆)
+    * [断线自动重连](#断线自动重连)
 * [MTU 开销](#mtu-开销)
     * [WireGuard 的 MTU 计算](#wireguard-的-mtu-计算)
 * [版本兼容性](#版本兼容性)
@@ -257,6 +258,19 @@ RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0
 
 [返回目录](#目录)
 
+### 断线自动重连
+
+客户端位于 NAT 之后且公网 IP（或 NAT 映射）发生变化时，旧的伪 TCP 连接会失效。客户端在收不到服务端任何数据
+15–25 秒（随机）后，会按 Linux 内核 TCP keepalive 的格式发送探测包（不带载荷、序号比当前小 1 的 ACK），
+每隔 3–6 秒（随机）一个，连续 3 个都没有应答就关闭连接，从失效到判定断线共需 24–43 秒。
+关闭连接后客户端不会主动重连，而是由下一个 UDP 包触发新的握手；如果本地应用持续有流量（如开启了 PersistentKeepalive 的
+WireGuard），判定断线后约一个 RTT 即可恢复，没有流量时则在下次有流量时才建立连接。
+
+服务端对收到的每个空 ACK 都会立即回复一个 ACK（客户端从不回复），因此即使最后的数据包丢失、两端序号不一致，
+探测也能得到应答。服务端无需额外配置，但两端都必须使用包含此功能的版本重新编译。
+
+[返回目录](#目录)
+
 ## MTU 开销
 
 Phantun 力求把隧道开销降到最低。与普通 UDP 包相比（以 IPv4 为例）：
@@ -390,6 +404,7 @@ Copyright 2021-2025 Datong Sun (dndx@idndx.com)
         * [Start the client](#start-the-client)
     * [Automatic firewall rules](#automatic-firewall-rules)
     * [HTTP obfuscation](#http-obfuscation)
+    * [Automatic reconnection](#automatic-reconnection)
 * [MTU overhead](#mtu-overhead)
     * [MTU calculation for WireGuard](#mtu-calculation-for-wireguard)
 * [Version compatibility](#version-compatibility)
@@ -641,6 +656,24 @@ RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote 127.0.0.1:1234
 RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 \
     --http-host www.example.com --fake-http --http-handshake
 ```
+
+[Back to TOC](#table-of-contents)
+
+### Automatic reconnection
+
+When the client is behind NAT and its public IP (or NAT mapping) changes, the old fake TCP
+connection stops working. After 15–25 seconds (random) without anything from the server, the
+client sends keepalive probes formatted like the Linux kernel's TCP keepalive (an empty ACK one
+byte behind the current sequence number), one every 3–6 seconds (random). If none of 3 probes is
+answered, the connection is closed, 24–43 seconds after it stopped working in total.
+
+The client does not reconnect by itself: the next UDP packet starts a new handshake. If the local
+application keeps sending (e.g. WireGuard with PersistentKeepalive), the connection recovers about
+one RTT after being declared dead; otherwise a new one is made when traffic resumes.
+
+The server answers every empty ACK it receives with an ACK right away (the client never answers),
+so probes are answered even if the last data packet was lost and sequence numbers no longer match.
+No server configuration is needed, but both ends must be rebuilt with this feature.
 
 [Back to TOC](#table-of-contents)
 

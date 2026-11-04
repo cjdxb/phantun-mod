@@ -15,7 +15,8 @@ use tokio::time;
 use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
 
-use phantun::UDP_TTL;
+use phantun::{KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_PROBES, UDP_TTL};
+use rand::Rng;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -319,12 +320,14 @@ async fn main() -> io::Result<()> {
             // from forwarding UDP packets
 
             let packet_received = Arc::new(Notify::new());
+            let inbound = Arc::new(Notify::new());
             let quit = CancellationToken::new();
 
             for i in 0..num_cpus {
                 let sock = sock.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
+                let inbound = inbound.clone();
 
                 tokio::spawn(async move {
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
@@ -372,17 +375,26 @@ async fn main() -> io::Result<()> {
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
                                     Some(size) => {
+                                        // anything from the server, keepalive ACKs included,
+                                        // proves the path is still alive
+                                        inbound.notify_one();
+
+                                        // empty segments are not traffic, otherwise
+                                        // keepalive would keep the connection open forever
+                                        if size == 0 {
+                                            continue;
+                                        }
+
                                         // late duplicate of the HTTP handshake response
                                         if http_handshake && http::is_response(&buf_tcp[..size]) {
                                             continue;
                                         }
 
-                                        if size > 0
-                                            && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
-                                                quit.cancel();
-                                                return;
-                                            }
+                                        if let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                            error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                            quit.cancel();
+                                            return;
+                                        }
                                     },
                                     None => {
                                         debug!("removed fake TCP socket from connections table");
@@ -398,6 +410,45 @@ async fn main() -> io::Result<()> {
                                 return;
                             },
                         };
+                    }
+                });
+            }
+
+            {
+                let quit = quit.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = time::sleep(rand::rng().random_range(KEEPALIVE_IDLE)) => {},
+                            _ = inbound.notified() => continue,
+                            _ = quit.cancelled() => return,
+                        }
+
+                        let mut answered = false;
+                        for _ in 0..KEEPALIVE_PROBES {
+                            if sock.send_keepalive().await.is_none() {
+                                quit.cancel();
+                                return;
+                            }
+
+                            tokio::select! {
+                                _ = time::sleep(rand::rng().random_range(KEEPALIVE_INTERVAL)) => {},
+                                _ = inbound.notified() => {
+                                    answered = true;
+                                    break;
+                                },
+                                _ = quit.cancelled() => return,
+                            }
+                        }
+
+                        if !answered {
+                            info!(
+                                "No answer to {} keepalive probes, closing connection {}",
+                                KEEPALIVE_PROBES, sock
+                            );
+                            quit.cancel();
+                            return;
+                        }
                     }
                 });
             }

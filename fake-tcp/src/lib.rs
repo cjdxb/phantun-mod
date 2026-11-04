@@ -119,6 +119,8 @@ pub struct Socket {
     ack: AtomicU32,
     last_ack: AtomicU32,
     state: State,
+    // accepted (server side) connection, answers empty ACKs
+    passive: bool,
 }
 
 /// A socket that represents a unique TCP connection between a server and client.
@@ -136,6 +138,7 @@ impl Socket {
         remote_addr: SocketAddr,
         ack: Option<u32>,
         state: State,
+        passive: bool,
     ) -> (Socket, flume::Sender<Bytes>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
 
@@ -150,6 +153,7 @@ impl Socket {
                 ack: AtomicU32::new(ack.unwrap_or(0)),
                 last_ack: AtomicU32::new(ack.unwrap_or(0)),
                 state,
+                passive,
             },
             incoming_tx,
         )
@@ -187,6 +191,32 @@ impl Socket {
         }
     }
 
+    /// Sends a keepalive probe the same way the Linux kernel does: an empty
+    /// segment one byte behind `seq`. The accepting end answers any empty ACK
+    /// with an ACK right away.
+    ///
+    /// A return of `None` means the Tun socket returned an error
+    /// and this socket must be closed.
+    pub async fn send_keepalive(&self) -> Option<()> {
+        match self.state {
+            State::Established => {
+                let ack = self.ack.load(Ordering::Relaxed);
+                self.last_ack.store(ack, Ordering::Relaxed);
+
+                let buf = build_tcp_packet(
+                    self.local_addr,
+                    self.remote_addr,
+                    self.seq.load(Ordering::Relaxed).wrapping_sub(1),
+                    ack,
+                    tcp::TcpFlags::ACK,
+                    None,
+                );
+                self.tun.send(&buf).await.ok().and(Some(()))
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// Attempt to receive a datagram from the other end.
     ///
     /// This method takes `&self`, and it can be called safely by multiple threads
@@ -206,6 +236,21 @@ impl Socket {
                     }
 
                     let payload = tcp_packet.payload();
+
+                    // Empty ACK, keepalive probes included. It never moves `ack`, as its
+                    // sequence number may be behind (probe) or ahead (lost data) of what
+                    // we expect. Only the accepting end answers, whatever the sequence
+                    // number is, so that answers are never answered back.
+                    if payload.is_empty() && tcp_packet.get_flags() == tcp::TcpFlags::ACK {
+                        if self.passive {
+                            let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
+                            if let Err(e) = self.tun.try_send(&buf) {
+                                info!("Connection {} unable to answer empty ACK: {}", self, e)
+                            }
+                        }
+
+                        return Some(0);
+                    }
 
                     let new_ack = tcp_packet.get_sequence().wrapping_add(payload.len() as u32);
                     let last_ask = self.last_ack.load(Ordering::Relaxed);
@@ -472,6 +517,7 @@ impl Stack {
                     addr,
                     None,
                     State::Idle,
+                    false,
                 );
 
                 assert!(tuples.insert(tuple, incoming).is_none());
@@ -550,6 +596,7 @@ impl Stack {
                                         remote_addr,
                                         Some(tcp_packet.get_sequence() + 1),
                                         State::Idle,
+                                        true,
                                     );
                                     assert!(shared
                                         .tuples
