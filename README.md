@@ -20,7 +20,7 @@ A modified [dndx/phantun](https://github.com/dndx/phantun) with automatic firewa
     * [服务端 phantun_server](#服务端-phantun_server)
 * [功能详解](#功能详解)
     * [自动管理防火墙规则（--iface）](#自动管理防火墙规则--iface)
-    * [HTTP 伪装（--fake-http / --http-handshake）](#http-伪装--fake-http----http-handshake)
+    * [HTTP 伪装（--fake-http / --http-handshake / --http-payload）](#http-伪装--fake-http----http-handshake----http-payload)
     * [断线检测与自动重连](#断线检测与自动重连)
 * [注意事项](#注意事项)
 * [许可证与致谢](#许可证与致谢)
@@ -44,6 +44,7 @@ udp2raw 的对比请参阅[原版 README](https://github.com/dndx/phantun#readme
 | 自动管理防火墙规则 | 客户端、服务端 | `--iface`、`--fw-backend` | 启动时开启 IP 转发并添加 MASQUERADE / DNAT 规则，退出时自动删除 |
 | HTTP 诱饵包 | 仅客户端 | `--fake-http`、`--fake-ttl`、`--fake-repeat`、`--http-host` | 握手时发送只能存活几跳的 HTTP 请求包，让路径上的检测设备看到 HTTP |
 | HTTP 握手 | 两端都要开启 | `--http-handshake`、`--http-host` | TCP 握手后先交换一对真实的 HTTP 请求/响应，再开始转发 UDP |
+| HTTP 逐包包装 | 两端都要开启 | `--http-payload`、`--http-host`（仅客户端） | 每个 UDP 载荷单独放进一条完整的 HTTP 消息，不重传 |
 | Keepalive 断线检测 | 客户端发起，服务端应答 | 无（自动生效） | 客户端长时间收不到服务端数据时发送探测包，无应答则关闭连接，由下一个 UDP 包重新建连 |
 | 优雅退出 | 客户端、服务端 | 无 | 收到 `SIGINT` / `SIGTERM` 时正常退出（用于清理防火墙规则） |
 
@@ -116,11 +117,12 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 | `--handshake-packet <文件>` | 无 | TCP 握手后把该文件内容作为第一个数据包发给服务端（单包发送，不能超过 MTU） |
 | ★ `--iface <网卡>` | 无 | 面向互联网的网卡。指定后自动开启 IP 转发、添加 MASQUERADE 规则，退出时删除。需要 root |
 | ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | 防火墙后端，`auto` 表示有 `nft` 命令就用 nft。必须配合 `--iface` |
-| ★ `--http-host <主机名>` | 无 | HTTP 请求中的 `Host` 头，`--fake-http` 和 `--http-handshake` 都需要它 |
+| ★ `--http-host <主机名>` | 无 | HTTP 请求中的 `Host` 头，`--fake-http`、`--http-handshake` 和 `--http-payload` 都需要它 |
 | ★ `--fake-http` | 关 | 收到 SYN+ACK 后发送有限 TTL 的 HTTP 请求诱饵包。需要 `--http-host` |
 | ★ `--fake-ttl <1-254>` | `3` | 诱饵包离开本机后还能存活的跳数 |
 | ★ `--fake-repeat <N>` | `2` | 每个连接发送的诱饵包数量 |
 | ★ `--http-handshake` | 关 | TCP 握手后与服务端交换真实的 HTTP 请求/响应，再转发 UDP。服务端也必须开启。需要 `--http-host` |
+| ★ `--http-payload` | 关 | 每个 UDP 载荷单独放进一条 HTTP `POST`。服务端也必须开启。需要 `--http-host` |
 
 ### 服务端 phantun_server
 
@@ -134,10 +136,11 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 | `--tun-local6 <IP>` | `fcc9::1` | TUN 接口本机端 IPv6 地址 |
 | `--tun-peer6 <IP>` | `fcc9::2` | TUN 接口对端 IPv6 地址，即 IPv6 DNAT 的目标地址 |
 | `-4, --ipv4-only` | 关 | 不给 TUN 接口分配 IPv6 地址（`--iface` 也只添加 IPv4 规则） |
-| `--handshake-packet <文件>` | 无 | TCP 握手后把该文件内容作为第一个数据包发给客户端 |
+| `--handshake-packet <文件>` | 无 | TCP 握手后把该文件内容作为第一个数据包发给客户端。同时开启 `--http-handshake` 时，改为在 HTTP 响应之后发送 |
 | ★ `--iface <网卡>` | 无 | 面向互联网的网卡。指定后自动开启 IP 转发、添加 DNAT 规则，退出时删除。需要 root |
 | ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | 同客户端 |
-| ★ `--http-handshake` | 关 | 用 HTTP 响应回答开启了 `--http-handshake` 的客户端发来的 HTTP 请求，而不是把它当 UDP 转发 |
+| ★ `--http-handshake` | 关 | 要求每个连接先发来开启了 `--http-handshake` 的客户端的 HTTP 请求，并用 HTTP 响应回答。先发其他数据的连接会被关闭 |
+| ★ `--http-payload` | 关 | 只接受放在 HTTP `POST` 里的 UDP 载荷，并且把发出的 UDP 载荷放进 HTTP 响应。客户端也必须开启 |
 
 ## 功能详解
 
@@ -161,9 +164,9 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 使用 nft 后端时，其他工具（例如通过 iptables 管理规则的 Docker）设置的 `FORWARD` drop 规则不会被绕过，
 这种情况请使用 `--fw-backend iptables`。
 
-### HTTP 伪装（--fake-http / --http-handshake）
+### HTTP 伪装（--fake-http / --http-handshake / --http-payload）
 
-两个选项相互独立，可以单独或同时使用：
+三个选项相互独立，可以单独或同时使用：
 
 **`--fake-http`（仅客户端）**：客户端收到 SYN+ACK 后，发送 `--fake-repeat` 个 HTTP `GET` 请求诱饵包，
 这些包的 TTL 只够存活 `--fake-ttl` 跳。路径上的检测设备会看到一个 HTTP 请求，而诱饵包通常在到达服务端之前就被丢弃。
@@ -176,7 +179,11 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 `HTTP/1.1 200 OK`，之后才开始转发 UDP。客户端等待响应 1 秒，超时重发，最多 3 次，仍失败则放弃该连接。
 这两个包由 Phantun 自己消费，不会转发给 UDP 应用。
 
-> 注意：`--http-handshake` 两端必须同时开启或同时关闭。只开客户端会导致握手失败；只开服务端则客户端的数据照常转发，但不会有 HTTP 交换。
+> 注意：`--http-handshake` 两端必须同时开启或同时关闭。只开客户端会导致握手失败；只开服务端则客户端发来的数据会被拒绝，连接被关闭。
+
+**`--http-payload`（两端）**：每个 UDP 载荷仍然是一个 fake TCP 段，段内是一条完整的 HTTP/1.1 消息。客户端发送带 `Host` 和 `Content-Length` 的 `POST`，服务端发送带 `Content-Length` 的 `HTTP/1.1 200 OK`。对端只取出正文再交给 UDP 应用。长度对不上的段直接丢弃，不缓存、不拼到下一段，因此不需要重传。空的 keepalive ACK，以及 `--http-handshake` 那一对 GET / 无正文的 200，都不走这层包装。
+
+> 注意：`--http-payload` 两端必须同时开启或同时关闭。只开一端时，开启的一端会丢掉对端发来的未包装数据；未开启的一端则把整条 HTTP 消息（含头部）原样转发给 UDP 应用，通常会被应用当作无效包丢弃。`Host` 为 `www.example.com`、正文长度是 4 位数时，上行请求头是 128 字节，下行响应头是 105 字节。
 
 ### 断线检测与自动重连
 
@@ -195,7 +202,8 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 
 * **MTU**：Phantun 不做分片，并总是设置 `DF` 位，包长不能超过链路 MTU。承载 WireGuard 时，WireGuard 接口 MTU
   可按 `链路 MTU - IP 头(IPv4 20 / IPv6 40) - TCP 头 20 - WireGuard 开销 32` 计算，例如 1500 的链路用 IPv4 时设为 `1428`。
-  使用 `--handshake-packet` 时文件大小同样不能超过 MTU。
+  使用 `--handshake-packet` 时文件大小同样不能超过 MTU。开启 `--http-payload` 时还要减去 HTTP 头
+  （`www.example.com` 的上行请求头为 128 字节，同样的链路上 WireGuard MTU 约为 `1300`）。
 * **无加密**：Phantun 只做伪装，不提供加密和防重放，请在上层使用 WireGuard 等加密协议。
 * **只能穿过 L3/L4 设备**：无法穿过 HTTP 代理等 L7 代理，HTTP 伪装只是让流量“看起来像”HTTP。
 * **权限**：`--iface` 需要 root；不使用 `--iface` 时只需 `cap_net_admin`。
@@ -222,7 +230,7 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
     * [Server: phantun_server](#server-phantun_server)
 * [Features in detail](#features-in-detail)
     * [Automatic firewall rules (--iface)](#automatic-firewall-rules---iface)
-    * [HTTP obfuscation (--fake-http / --http-handshake)](#http-obfuscation---fake-http----http-handshake)
+    * [HTTP obfuscation (--fake-http / --http-handshake / --http-payload)](#http-obfuscation---fake-http----http-handshake----http-payload)
     * [Dead connection detection and reconnection](#dead-connection-detection-and-reconnection)
 * [Notes](#notes)
 * [License and credits](#license-and-credits)
@@ -249,6 +257,7 @@ This fork is based on upstream v0.8.1 and addresses three practical pain points:
 | Automatic firewall rules | Client, server | `--iface`, `--fw-backend` | Enables IP forwarding and adds MASQUERADE / DNAT rules on startup, removes them on exit |
 | HTTP decoys | Client only | `--fake-http`, `--fake-ttl`, `--fake-repeat`, `--http-host` | Sends HTTP request packets that survive only a few hops during the handshake, so middleboxes see HTTP |
 | HTTP handshake | Both sides | `--http-handshake`, `--http-host` | Exchanges a real HTTP request/response after the TCP handshake, before forwarding UDP |
+| HTTP per-packet wrap | Both sides | `--http-payload`, `--http-host` (client only) | Puts each UDP payload in its own complete HTTP message, with no retransmission |
 | Keepalive | Client probes, server answers | None (always on) | When the server has been silent for a while, the client sends probes; if none is answered, the connection is closed and the next UDP packet makes a new one |
 | Graceful shutdown | Client, server | None | Exits cleanly on `SIGINT` / `SIGTERM` (so firewall rules can be removed) |
 
@@ -326,11 +335,12 @@ Options marked with ★ are new in this fork. Run with `-h` to list all options.
 | `--handshake-packet <FILE>` | None | After the TCP handshake, send the content of this file to the server as the first data packet (sent as one packet, must fit in the MTU) |
 | ★ `--iface <IFACE>` | None | Internet facing interface. When set, enables IP forwarding and adds MASQUERADE rules, removed on exit. Requires root |
 | ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | Firewall backend; `auto` uses nft when the `nft` command is available. Requires `--iface` |
-| ★ `--http-host <HOST>` | None | `Host` header of the HTTP request, required by `--fake-http` and `--http-handshake` |
+| ★ `--http-host <HOST>` | None | `Host` header of the HTTP request, required by `--fake-http`, `--http-handshake` and `--http-payload` |
 | ★ `--fake-http` | Off | After receiving SYN+ACK, send HTTP request decoys with a limited TTL. Requires `--http-host` |
 | ★ `--fake-ttl <1-254>` | `3` | Number of hops the decoys survive after leaving this host |
 | ★ `--fake-repeat <N>` | `2` | Number of decoys sent per connection |
 | ★ `--http-handshake` | Off | After the TCP handshake, exchange a real HTTP request/response with the server before forwarding UDP. The server must enable it too. Requires `--http-host` |
+| ★ `--http-payload` | Off | Send each UDP payload in its own HTTP `POST`. The server must enable it too. Requires `--http-host` |
 
 ### Server: phantun_server
 
@@ -344,10 +354,11 @@ Options marked with ★ are new in this fork. Run with `-h` to list all options.
 | `--tun-local6 <IP>` | `fcc9::1` | IPv6 address of the OS end of the TUN interface |
 | `--tun-peer6 <IP>` | `fcc9::2` | IPv6 address of the Phantun end of the TUN interface, i.e. the IPv6 DNAT target |
 | `-4, --ipv4-only` | Off | Do not assign IPv6 addresses to the TUN interface (`--iface` then adds IPv4 rules only) |
-| `--handshake-packet <FILE>` | None | After the TCP handshake, send the content of this file to the client as the first data packet |
+| `--handshake-packet <FILE>` | None | After the TCP handshake, send the content of this file to the client as the first data packet. With `--http-handshake`, send it after the HTTP response |
 | ★ `--iface <IFACE>` | None | Internet facing interface. When set, enables IP forwarding and adds DNAT rules, removed on exit. Requires root |
 | ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | Same as the client |
-| ★ `--http-handshake` | Off | Answer the HTTP request from a client started with `--http-handshake` with an HTTP response instead of forwarding it as UDP |
+| ★ `--http-handshake` | Off | Require every connection to start with the HTTP request from a client started with `--http-handshake`, and answer it with an HTTP response. Connections sending other data first are closed |
+| ★ `--http-payload` | Off | Accept UDP payloads only inside HTTP `POST` requests, and send each UDP payload inside an HTTP response. The client must enable it too |
 
 ## Features in detail
 
@@ -373,9 +384,9 @@ instead of being duplicated.
 With the nft backend, `FORWARD` drop rules set by other tools (e.g. Docker via iptables) are not
 bypassed; use `--fw-backend iptables` in that case.
 
-### HTTP obfuscation (--fake-http / --http-handshake)
+### HTTP obfuscation (--fake-http / --http-handshake / --http-payload)
 
-The two options are independent and can be used alone or together:
+The three options are independent and can be used alone or together:
 
 **`--fake-http` (client only)**: after receiving SYN+ACK, the client sends `--fake-repeat` HTTP `GET`
 request decoys whose TTL lets them survive only `--fake-ttl` hops. Middleboxes on the path see an
@@ -392,8 +403,21 @@ second for the response and retransmits on timeout, up to 3 times, then gives up
 Both packets are consumed by Phantun and never forwarded to the UDP application.
 
 > Note: `--http-handshake` must be enabled or disabled on both sides. Enabling it only on the client
-> makes the handshake fail; enabling it only on the server forwards client data as usual, with no
-> HTTP exchange.
+> makes the handshake fail; enabling it only on the server rejects the client's data and closes the
+> connection.
+
+**`--http-payload` (both sides)**: each UDP payload is still one fake TCP segment, and that segment is one
+complete HTTP/1.1 message. The client sends a `POST` with `Host` and `Content-Length`; the server sends
+`HTTP/1.1 200 OK` with `Content-Length`. The peer forwards only the body to the UDP application. A
+segment whose length does not match is dropped; nothing is buffered for the next segment, so this
+needs no retransmission. Empty keepalive ACKs, and the GET / bodyless 200 from `--http-handshake`,
+are not wrapped.
+
+> Note: `--http-payload` must be enabled or disabled on both sides. If only one side enables it, the
+> enabling side drops the unwrapped data it receives, and the other side forwards each whole HTTP
+> message, headers included, to the UDP application, which usually rejects it as invalid. With `Host: www.example.com` and a
+> 4-digit body length, the upload request header is 128 bytes and the download response header is
+> 105 bytes.
 
 ### Dead connection detection and reconnection
 
@@ -419,7 +443,9 @@ answered. It takes about 24–43 seconds from the connection dying to it being c
 * **MTU**: Phantun does not fragment and always sets the `DF` bit, so packets must fit in the link
   MTU. For WireGuard, set the interface MTU to
   `link MTU - IP header (IPv4 20 / IPv6 40) - TCP header 20 - WireGuard overhead 32`, e.g. `1428` for
-  a 1500 link over IPv4. Files passed to `--handshake-packet` must fit in the MTU as well.
+  a 1500 link over IPv4. Files passed to `--handshake-packet` must fit in the MTU as well. With
+  `--http-payload`, also subtract the HTTP header (`www.example.com` upload header is 128 bytes, so the
+  WireGuard MTU on that same link is about `1300`).
 * **No encryption**: Phantun only obfuscates; it has no encryption or anti-replay. Use an encrypted
   protocol such as WireGuard on top.
 * **L3/L4 only**: it cannot pass through L7 proxies such as HTTP proxies. HTTP obfuscation only makes

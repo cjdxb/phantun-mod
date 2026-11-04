@@ -1,6 +1,6 @@
 use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
-use fake_tcp::Stack;
+use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
 use phantun::firewall::{Firewall, Nat};
 use phantun::http;
@@ -8,6 +8,7 @@ use phantun::utils::{assign_ipv6_address, new_udp_reuseport, shutdown_signal};
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
@@ -99,7 +100,8 @@ async fn main() -> io::Result<()> {
                 .required(false)
                 .value_name("PATH")
                 .help("Specify a file, which, after TCP handshake, its content will be sent as the \
-                      first data packet to the client.\n\
+                      first data packet to the client. With --http-handshake, the packet is sent \
+                      after the HTTP response instead.\n\
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
@@ -125,8 +127,18 @@ async fn main() -> io::Result<()> {
             Arg::new("http_handshake")
                 .long("http-handshake")
                 .required(false)
-                .help("Answer the HTTP request sent by a Phantun Client started with --http-handshake \
-                       with an HTTP response, instead of forwarding it as UDP")
+                .help("Require every connection to start with the HTTP request sent by a Phantun Client \
+                       started with --http-handshake, and answer it with an HTTP response. Connections \
+                       sending other data first are closed")
+                .action(ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("http_payload")
+                .long("http-payload")
+                .required(false)
+                .help("Accept UDP payloads only from HTTP POST requests, and send each UDP payload \
+                       back in its own HTTP response. No retransmission. The client must also be \
+                       started with --http-payload")
                 .action(ArgAction::SetTrue)
         )
         .get_matches();
@@ -170,11 +182,13 @@ async fn main() -> io::Result<()> {
     };
 
     let tun_name = matches.get_one::<String>("tun").unwrap();
-    let handshake_packet: Option<Vec<u8>> = matches
+    let handshake_packet: Option<Arc<[u8]>> = matches
         .get_one::<String>("handshake_packet")
         .map(fs::read)
-        .transpose()?;
+        .transpose()?
+        .map(Arc::<[u8]>::from);
     let http_handshake = matches.get_flag("http_handshake");
+    let http_payload = matches.get_flag("http_payload");
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -215,6 +229,12 @@ async fn main() -> io::Result<()> {
     let mut stack = Stack::new(tun, tun_local, tun_local6);
     stack.listen(local_port);
     info!("Listening on {}", local_port);
+    if http_handshake {
+        info!("HTTP handshake enabled");
+    }
+    if http_payload {
+        info!("HTTP payload enabled");
+    }
 
     let main_loop = tokio::spawn(async move {
         let mut buf_udp = [0u8; MAX_PACKET_LEN];
@@ -223,17 +243,23 @@ async fn main() -> io::Result<()> {
         loop {
             let sock = Arc::new(stack.accept().await);
             info!("New connection: {}", sock);
-            if let Some(ref p) = handshake_packet {
-                if sock.send(p).await.is_none() {
-                    error!("Failed to send handshake packet to remote, closing connection.");
-                    continue;
-                }
+            // With HTTP handshake the client discards every segment until the
+            // response arrives, so this packet is sent by the worker afterwards.
+            if !http_handshake {
+                if let Some(p) = handshake_packet.as_deref() {
+                    if send_payload(&sock, http_payload, p).await.is_none() {
+                        error!("Failed to send handshake packet to remote, closing connection.");
+                        continue;
+                    }
 
-                debug!("Sent handshake packet to: {}", sock);
+                    debug!("Sent handshake packet to: {}", sock);
+                }
             }
 
             let packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
+            // shared by all workers, any of them may receive the HTTP request
+            let http_done = Arc::new(AtomicBool::new(!http_handshake));
             let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -247,6 +273,8 @@ async fn main() -> io::Result<()> {
                 let sock = sock.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
+                let http_done = http_done.clone();
+                let handshake_packet = handshake_packet.clone();
                 let udp_sock = new_udp_reuseport(local_addr);
 
                 tokio::spawn(async move {
@@ -255,7 +283,7 @@ async fn main() -> io::Result<()> {
                     loop {
                         tokio::select! {
                             Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if sock.send(&buf_udp[..size]).await.is_none() {
+                                if send_payload(&sock, http_payload, &buf_udp[..size]).await.is_none() {
                                     quit.cancel();
                                     return;
                                 }
@@ -267,20 +295,61 @@ async fn main() -> io::Result<()> {
                                     Some(size) => {
                                         // HTTP handshake (or its retransmission) from client
                                         if http_handshake && http::is_request(&buf_tcp[..size]) {
+                                            // set before replying: the client sends data only
+                                            // after the response, possibly to another worker.
+                                            // The handshake packet follows that response. The
+                                            // client discards anything it reads before it, and a
+                                            // retransmitted request repeats the response only.
+                                            let first = !http_done.swap(true, Ordering::Relaxed);
                                             if sock.send(http::RESPONSE).await.is_none() {
                                                 quit.cancel();
                                                 return;
                                             }
+                                            if first {
+                                                if let Some(p) = handshake_packet.as_deref() {
+                                                    if send_payload(&sock, http_payload, p).await.is_none() {
+                                                        error!("Failed to send handshake packet to remote, closing connection.");
+                                                        quit.cancel();
+                                                        return;
+                                                    }
+                                                    debug!("Sent handshake packet to: {}", sock);
+                                                }
+                                            }
 
+                                            info!(
+                                                "HTTP handshake with {} done, Host {}",
+                                                sock,
+                                                http::request_host(&buf_tcp[..size])
+                                                    .as_deref()
+                                                    .unwrap_or("<none>")
+                                            );
                                             continue;
                                         }
 
-                                        if size > 0
-                                            && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                        if size > 0 && !http_done.load(Ordering::Relaxed) {
+                                            error!("{} sent data before HTTP handshake, closing connection", sock);
+                                            quit.cancel();
+                                            return;
+                                        }
+
+                                        if size > 0 {
+                                            let payload = if http_payload {
+                                                match http::unwrap_request(&buf_tcp[..size]) {
+                                                    Some(body) => body,
+                                                    None => {
+                                                        debug!("dropping TCP segment that is not an HTTP wrapped request");
+                                                        continue;
+                                                    }
+                                                }
+                                            } else {
+                                                &buf_tcp[..size]
+                                            };
+                                            if let Err(e) = udp_sock.send(payload).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
                                                 quit.cancel();
                                                 return;
                                             }
+                                        }
                                     },
                                     None => {
                                         quit.cancel();
@@ -324,5 +393,15 @@ async fn main() -> io::Result<()> {
             info!("Received shutdown signal, exiting");
             Ok(())
         },
+    }
+}
+
+async fn send_payload(sock: &Socket, wrap: bool, payload: &[u8]) -> Option<()> {
+    if wrap {
+        let packet = http::wrap_response(payload);
+        http::warn_if_oversized(sock, &packet);
+        sock.send(&packet).await
+    } else {
+        sock.send(payload).await
     }
 }

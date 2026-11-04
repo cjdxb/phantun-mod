@@ -127,7 +127,7 @@ async fn main() -> io::Result<()> {
                 .long("http-host")
                 .required(false)
                 .value_name("HOST")
-                .help("Sets the Host header used by --fake-http and --http-handshake")
+                .help("Sets the Host header used by --fake-http, --http-handshake and --http-payload")
         )
         .arg(
             Arg::new("fake_http")
@@ -162,6 +162,15 @@ async fn main() -> io::Result<()> {
                 .required(false)
                 .help("After TCP handshake, exchange a real HTTP request/response with the server \
                        before forwarding any UDP traffic. The server must also be started with --http-handshake")
+                .action(ArgAction::SetTrue)
+                .requires("http_host")
+        )
+        .arg(
+            Arg::new("http_payload")
+                .long("http-payload")
+                .required(false)
+                .help("Send each UDP payload in its own HTTP POST, and accept UDP payloads only from \
+                       HTTP responses. No retransmission. The server must also be started with --http-payload")
                 .action(ArgAction::SetTrue)
                 .requires("http_host")
         )
@@ -211,10 +220,28 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
-    let http_request = matches
-        .get_one::<String>("http_host")
-        .map(|host| http::request(host));
+    let http_host = matches.get_one::<String>("http_host").cloned();
+    // the host goes into every HTTP header this client builds
+    if http_host
+        .as_deref()
+        .is_some_and(|host| host.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')))
+    {
+        return Err(io::Error::other(
+            "--http-host must not contain CR, LF, or NUL",
+        ));
+    }
+    let http_request = http_host.as_deref().map(http::request);
     let http_handshake = matches.get_flag("http_handshake");
+    let http_payload_host: Option<String> = matches
+        .get_flag("http_payload")
+        .then(|| http_host.clone().unwrap());
+    if let Some(host) = http_payload_host.as_deref() {
+        let overhead = http::wrap_request(host, &[0u8; 1300]).len() - 1300;
+        info!(
+            "HTTP payload enabled: Host {}, request header {} bytes",
+            host, overhead
+        );
+    }
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -255,12 +282,26 @@ async fn main() -> io::Result<()> {
 
     let mut stack = Stack::new(tun, tun_peer, tun_peer6);
     if matches.get_flag("fake_http") {
+        let fake_ttl = *matches.get_one::<u8>("fake_ttl").unwrap();
+        let fake_repeat = *matches.get_one::<usize>("fake_repeat").unwrap();
         stack.set_fake_packet(
             http_request.as_ref().unwrap(),
             // +1 because packets coming out of the Tun interface are forwarded
             // by the kernel, which decrements TTL once before they leave this host
-            matches.get_one::<u8>("fake_ttl").unwrap() + 1,
-            *matches.get_one::<usize>("fake_repeat").unwrap(),
+            fake_ttl + 1,
+            fake_repeat,
+        );
+        info!(
+            "Fake HTTP enabled: Host {}, TTL {}, {} packet(s) per connection",
+            http_host.as_deref().unwrap(),
+            fake_ttl,
+            fake_repeat
+        );
+    }
+    if http_handshake {
+        info!(
+            "HTTP handshake enabled: Host {}",
+            http_host.as_deref().unwrap()
         );
     }
 
@@ -274,7 +315,7 @@ async fn main() -> io::Result<()> {
             // 2. It is some extra packets not filtered by more specific
             //    connected UDP socket yet
             if let Some(sock) = connections.read().await.get(&udp_remote_addr) {
-                sock.send(&buf_r[..size]).await;
+                send_payload(sock, http_payload_host.as_deref(), &buf_r[..size]).await;
                 continue;
             }
 
@@ -292,11 +333,15 @@ async fn main() -> io::Result<()> {
                     continue;
                 }
 
-                debug!("HTTP handshake with {} done", sock);
+                info!(
+                    "HTTP handshake with {} done, Host {}",
+                    sock,
+                    http_host.as_deref().unwrap()
+                );
             }
 
             if let Some(ref p) = handshake_packet {
-                if sock.send(p).await.is_none() {
+                if send_payload(&sock, http_payload_host.as_deref(), p).await.is_none() {
                     error!("Failed to send handshake packet to remote, closing connection.");
                     continue;
                 }
@@ -305,7 +350,10 @@ async fn main() -> io::Result<()> {
             }
 
             // send first packet
-            if sock.send(&buf_r[..size]).await.is_none() {
+            if send_payload(&sock, http_payload_host.as_deref(), &buf_r[..size])
+                .await
+                .is_none()
+            {
                 continue;
             }
 
@@ -328,6 +376,7 @@ async fn main() -> io::Result<()> {
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
                 let inbound = inbound.clone();
+                let wrap_host = http_payload_host.clone();
 
                 tokio::spawn(async move {
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
@@ -364,7 +413,7 @@ async fn main() -> io::Result<()> {
                     loop {
                         tokio::select! {
                             Ok(size) = udp_sock.recv(&mut buf_udp) => {
-                                if sock.send(&buf_udp[..size]).await.is_none() {
+                                if send_payload(&sock, wrap_host.as_deref(), &buf_udp[..size]).await.is_none() {
                                     debug!("removed fake TCP socket from connections table");
                                     quit.cancel();
                                     return;
@@ -385,12 +434,25 @@ async fn main() -> io::Result<()> {
                                             continue;
                                         }
 
-                                        // late duplicate of the HTTP handshake response
-                                        if http_handshake && http::is_response(&buf_tcp[..size]) {
+                                        // late duplicate of the HTTP handshake response.
+                                        // Wrapped UDP responses are also 200s, but they have a body.
+                                        if http_handshake && http::is_handshake_response(&buf_tcp[..size]) {
                                             continue;
                                         }
 
-                                        if let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                        let payload = if wrap_host.is_some() {
+                                            match http::unwrap_response(&buf_tcp[..size]) {
+                                                Some(body) => body,
+                                                None => {
+                                                    debug!("dropping TCP segment that is not an HTTP wrapped response");
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            &buf_tcp[..size]
+                                        };
+
+                                        if let Err(e) = udp_sock.send(payload).await {
                                             error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
                                             quit.cancel();
                                             return;
@@ -486,5 +548,15 @@ async fn main() -> io::Result<()> {
             info!("Received shutdown signal, exiting");
             Ok(())
         },
+    }
+}
+
+async fn send_payload(sock: &Socket, host: Option<&str>, payload: &[u8]) -> Option<()> {
+    if let Some(host) = host {
+        let packet = http::wrap_request(host, payload);
+        http::warn_if_oversized(sock, &packet);
+        sock.send(&packet).await
+    } else {
+        sock.send(payload).await
     }
 }
