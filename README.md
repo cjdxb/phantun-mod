@@ -1,389 +1,211 @@
-# Phantun
+# Phantun-mod
 
-A lightweight and fast UDP to TCP obfuscator. / 轻量、高速的 UDP 转 TCP 混淆器。
+基于 [dndx/phantun](https://github.com/dndx/phantun) 的修改版：自动管理防火墙规则、HTTP 伪装、断线检测与自动重连。
+A modified [dndx/phantun](https://github.com/dndx/phantun) with automatic firewall rules, HTTP obfuscation and dead-connection detection.
 
-![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/dndx/phantun/rust.yml)
-![docs.rs](https://img.shields.io/docsrs/fake-tcp)
-
-**[中文](#中文文档) | [English](#english)**
+**[中文](#中文) | [English](#english)**
 
 ---
 
-# 中文文档
+# 中文
 
 ## 目录
 
-* [最新版本](#最新版本)
-* [概述](#概述)
-* [使用方法](#使用方法)
-    * [1. 开启内核 IP 转发](#1-开启内核-ip-转发)
-    * [2. 添加防火墙规则](#2-添加防火墙规则)
-        * [客户端 SNAT 规则](#客户端-snat-规则)
-        * [服务端 DNAT 规则](#服务端-dnat-规则)
-    * [3. 以非 root 用户运行](#3-以非-root-用户运行)
-    * [4. 启动 Phantun](#4-启动-phantun)
-        * [启动服务端](#启动服务端)
-        * [启动客户端](#启动客户端)
-    * [自动管理防火墙规则](#自动管理防火墙规则)
-    * [HTTP 混淆](#http-混淆)
-    * [断线自动重连](#断线自动重连)
-* [MTU 开销](#mtu-开销)
-    * [WireGuard 的 MTU 计算](#wireguard-的-mtu-计算)
-* [版本兼容性](#版本兼容性)
-* [开发文档](#开发文档)
-* [性能](#性能)
-* [未来计划](#未来计划)
-* [与 udp2raw 的对比](#与-udp2raw-的对比)
-* [许可证](#许可证)
+* [简介](#简介)
+* [相对原版的修改](#相对原版的修改)
+* [编译与安装](#编译与安装)
+* [快速开始](#快速开始)
+* [参数说明](#参数说明)
+    * [客户端 phantun_client](#客户端-phantun_client)
+    * [服务端 phantun_server](#服务端-phantun_server)
+* [功能详解](#功能详解)
+    * [自动管理防火墙规则（--iface）](#自动管理防火墙规则--iface)
+    * [HTTP 伪装（--fake-http / --http-handshake）](#http-伪装--fake-http----http-handshake)
+    * [断线检测与自动重连](#断线检测与自动重连)
+* [注意事项](#注意事项)
+* [许可证与致谢](#许可证与致谢)
 
-## 最新版本
+## 简介
 
-[v0.8.1](https://github.com/dndx/phantun/releases/tag/v0.8.1)
+Phantun 把 UDP 数据包流伪装成 TCP 连接，用于 UDP 被封锁或限速、而 TCP 可以通过的网络。它只在 UDP 包前加上
+IP + TCP 头，不做重传和流控，因此保留了 UDP 的特性（例如允许乱序），开销只有 12 字节。原理、性能数据和与
+udp2raw 的对比请参阅[原版 README](https://github.com/dndx/phantun#readme)。
 
-<details>
-  <summary>关于 MIPS 架构支持</summary>
+本修改版在原版 v0.8.1 基础上，主要解决三个实际使用中的痛点：
 
-  自 2023 年起，[Rust 对 MIPS 平台仅提供 Tier 3 支持](https://github.com/rust-lang/compiler-team/issues/648)。
-  因此 Phantun 的 MIPS 版本使用 nightly 工具链构建，仅尽力提供，不保证可用。
-</details>
+1. 每次部署都要手写 iptables/nftables 规则、手动开启 IP 转发；
+2. 纯 TCP 握手后紧跟二进制数据，容易被识别为非常规流量；
+3. 客户端在 NAT 后面且公网 IP 变化时，旧连接会“静默死亡”，客户端却一直不知道。
 
-## 概述
+## 相对原版的修改
 
-Phantun 将 UDP 数据包混淆成 TCP 连接，目标是以最小的处理和封装开销获得最高性能。
+| 修改 | 涉及端 | 相关参数 | 说明 |
+|------|--------|----------|------|
+| 自动管理防火墙规则 | 客户端、服务端 | `--iface`、`--fw-backend` | 启动时开启 IP 转发并添加 MASQUERADE / DNAT 规则，退出时自动删除 |
+| HTTP 诱饵包 | 仅客户端 | `--fake-http`、`--fake-ttl`、`--fake-repeat`、`--http-host` | 握手时发送只能存活几跳的 HTTP 请求包，让路径上的检测设备看到 HTTP |
+| HTTP 握手 | 两端都要开启 | `--http-handshake`、`--http-host` | TCP 握手后先交换一对真实的 HTTP 请求/响应，再开始转发 UDP |
+| Keepalive 断线检测 | 客户端发起，服务端应答 | 无（自动生效） | 客户端长时间收不到服务端数据时发送探测包，无应答则关闭连接，由下一个 UDP 包重新建连 |
+| 优雅退出 | 客户端、服务端 | 无 | 收到 `SIGINT` / `SIGTERM` 时正常退出（用于清理防火墙规则） |
 
-它常用于 UDP 被封锁或限速、但 TCP 可以通过的网络环境。
+`fake-tcp` 库的相应改动：
 
-Phantun 只是把 UDP 数据包流转换为混淆后的 TCP 数据包流。它使用的 TCP 协议栈可以穿过大多数
-L3/L4 有状态/无状态防火墙和 NAT 设备，但**无法**穿过 L7 代理。
-这种做法的好处是不会出现常见的 UDP over TCP 性能杀手，如重传和流量控制。即使在防火墙/NAT 看来
-连接是 TCP，底层 UDP 的特性（例如乱序到达）依然完整保留。
+* 新增 `Stack::set_fake_packet()`、`build_tcp_packet_with_ttl()`，用于发送指定 TTL 的诱饵包；
+* 新增 `Socket::send_keepalive()`，发送与 Linux 内核 TCP keepalive 相同格式的探测包（不带载荷、序号比当前小 1 的 ACK）；
+* 空 ACK 不再推进 `ack`；服务端（accept 得到的）socket 对每个空 ACK 立即回复 ACK，客户端 socket 从不回复，避免 ACK 循环；
+* 修复了退出时 `Socket::drop` 可能 panic 的问题。
 
-Phantun 意为 Phantom TUN（幽灵 TUN）：它只为 UDP 流量做“刚好足够”的工作，使其能以 TCP 数据包
-的形式穿过有状态防火墙/NAT。
+## 编译与安装
 
-Phantun 由 100% safe Rust 编写，针对多核系统做了大量优化，在高速链路上可以充分利用所有 CPU 资源。
-基准测试结果见[性能](#性能)一节。
+需要 Rust 工具链，且只能在 Linux 上运行（依赖 TUN 设备）。
 
-![Phantun benchmark results](images/phantun-vs-udp2raw-benchmark-result.png)
-![Traffic flow diagram](images/traffic-flow.png)
-
-## 使用方法
-
-下文示例假设：
-
-* **Phantun 服务端**在 TCP 端口 `4567` 监听客户端连接（服务端的 `--local`），并把 UDP 数据包转发到
-  `127.0.0.1:1234` 的 UDP 服务（服务端的 `--remote`）。
-* **Phantun 客户端**在 `127.0.0.1:1234` 监听 UDP 数据包（客户端的 `--local`），并连接到位于
-  `10.0.0.1:4567` 的 Phantun 服务端（客户端的 `--remote`）。
-
-Phantun 会在客户端和服务端各创建一个 TUN 接口。默认情况下，**客户端**为自己分配 `192.168.200.2`
-和 `fcc8::2`，**服务端**分配 `192.168.201.2` 和 `fcc9::2`。因此内核必须开启 IPv4/IPv6 转发，
-并配置 iptables/nftables 规则，在物理网卡地址与 Phantun TUN 接口地址之间做 NAT。
-
-TUN 接口名称和地址都可以自定义，运行程序时加 `-h` 查看相关选项。
-
-可以这样理解这个网络拓扑（参见上方示意图）：
-
-* Phantun 客户端相当于路由器后面一台私网 IP（`192.168.200.2`/`fcc8::2`）的机器。要访问互联网，
-  需要在流量离开网卡前对私网地址做 SNAT。
-* Phantun 服务端相当于路由器后面一台私网 IP（`192.168.201.2`/`fcc9::2`）的服务器。要让互联网访问它，
-  需要在路由器上对监听端口做 `DNAT`，把目标地址改成服务端监听的地址。
-
-在这两种情况下，运行 Phantun 的主机（及其 iptables）就扮演那台“路由器”，让 Phantun 用私网地址与外界通信。
-
-自 v0.4.1 起，TCP 和 UDP 两侧都完整支持 IPv6。命令行中的 IPv6 地址写作 `[::1]:1234`，也支持解析
-AAAA 记录。运行时加 `-h` 查看控制 IPv6 行为的选项。
-
-> **提示：** 如果以 root 运行，可以跳过第 1、2 步，改用 `--iface` 让 Phantun 自动配置，
-> 详见[自动管理防火墙规则](#自动管理防火墙规则)。
-
-### 1. 开启内核 IP 转发
-
-编辑 `/etc/sysctl.conf`，添加 `net.ipv4.ip_forward=1`，然后执行 `sudo sysctl -p /etc/sysctl.conf`。
-
-<details>
-  <summary>IPv6 额外配置</summary>
-
-  还需要设置 `net.ipv6.conf.all.forwarding=1`。
-</details>
-
-### 2. 添加防火墙规则
-
-#### 客户端 SNAT 规则
-
-客户端只需在物理网卡上开启 SNAT，把 Phantun 的地址转换成物理网络上可用的地址，用 masquerade 即可。
-
-注意：把 `eth0` 换成实际的物理网卡名称。
-
-**nftables：**
-
-```
-table inet nat {
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        iifname tun0 oif eth0 masquerade
-    }
-}
+```bash
+cargo build --release
+sudo install target/release/client /usr/local/bin/phantun_client
+sudo install target/release/server /usr/local/bin/phantun_server
 ```
 
-上面的规则使用 `inet` 表族，同时适用于 IPv4 和 IPv6。
+> **客户端和服务端都必须使用本修改版。** 原版服务端不会应答 keepalive 探测包，也不认识 HTTP 握手。
 
-**iptables：**
+## 快速开始
 
-```
-iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-```
+示例假设：服务端公网地址 `10.0.0.1`，在 TCP `4567` 端口接受连接，并把 UDP 转发给本机 `127.0.0.1:1234`
+（例如 WireGuard）；客户端在 `127.0.0.1:1234` 接收本地 UDP。两端的公网网卡都是 `eth0`。
 
-#### 服务端 DNAT 规则
+**最简用法**（root 运行，防火墙规则全自动）：
 
-服务端需要把 TCP 监听端口 DNAT 到 Phantun TUN 接口的地址。
+```bash
+# 服务端
+RUST_LOG=info phantun_server --local 4567 --remote 127.0.0.1:1234 --iface eth0
 
-注意：把 `eth0` 换成实际的物理网卡名称，把 `4567` 换成 Phantun 服务端实际使用的 TCP 端口。
-
-**nftables：**
-
-```
-table inet nat {
-    chain prerouting {
-        type nat hook prerouting priority dstnat; policy accept;
-        iif eth0 tcp dport 4567 dnat ip to 192.168.201.2
-        iif eth0 tcp dport 4567 dnat ip6 to fcc9::2
-    }
-}
+# 客户端
+RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --iface eth0
 ```
 
-**iptables：**
+**开启 HTTP 伪装**：
 
-```
-iptables -t nat -A PREROUTING -p tcp -i eth0 --dport 4567 -j DNAT --to-destination 192.168.201.2
-ip6tables -t nat -A PREROUTING -p tcp -i eth0 --dport 4567 -j DNAT --to-destination fcc9::2
-```
+```bash
+# 服务端
+RUST_LOG=info phantun_server --local 4567 --remote 127.0.0.1:1234 --iface eth0 --http-handshake
 
-### 3. 以非 root 用户运行
-
-本步骤可选。不建议以 root 身份运行面向网络的程序。只要具备 `cap_net_admin` 能力，Phantun 就可以
-完全以非 root 用户运行：
-
-```
-sudo setcap cap_net_admin=+pe phantun_server
-sudo setcap cap_net_admin=+pe phantun_client
-```
-
-注意：[自动管理防火墙规则](#自动管理防火墙规则)（`--iface`）需要 root 权限。
-
-### 4. 启动 Phantun
-
-运行程序时加 `-h` 可查看全部选项。
-
-#### 启动服务端
-
-`4567` 是 Phantun 监听的 TCP 端口，必须与上面的 DNAT 规则一致；`127.0.0.1:1234` 是新连接要转发到的 UDP 服务。
-
-```
-RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote 127.0.0.1:1234
-```
-
-`--remote` 也可以使用主机名：
-
-```
-RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote example.com:1234
-```
-
-服务端默认会给 TUN 接口同时分配 IPv4 和 IPv6 私网地址。如果不需要 IPv6，跳过上面的 IPv6 DNAT
-规则即可，TUN 接口上的 IPv6 地址不会对服务端产生副作用。
-
-#### 启动客户端
-
-`127.0.0.1:1234` 是 Phantun 监听的 UDP 地址和端口；`10.0.0.1:4567` 是要连接的 Phantun 服务端。
-
-```
-RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567
-```
-
-`--remote` 也可以使用主机名：
-
-```
-RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote example.com:4567
-```
-
-<details>
-  <summary>IPv6 示例</summary>
-
-  ```
-  RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote [fdxx::1234]:4567
-  ```
-
-  也支持带 AAAA 记录的域名。
-</details>
-
-### 自动管理防火墙规则
-
-不想手动执行第 1、2 步时，可以用 `--iface` 指定面向互联网的网卡。Phantun 会在启动时开启 IP 转发并
-添加所需的 MASQUERADE（客户端）或 DNAT（服务端）规则，在收到 `SIGINT`/`SIGTERM` 退出时将其删除。
-如果进程被强杀导致规则残留，下次启动时会自动替换。此选项需要 root 权限。
-
-```
-RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote 127.0.0.1:1234 --iface eth0
-RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --iface eth0
-```
-
-| 后端 | 规则存放位置 |
-|------|--------------|
-| nft（可用时优先） | 独立的 `inet phantun_<tun>` 表 |
-| iptables/ip6tables | 带 `phantun_<tun>` 注释的规则 |
-
-可用 `--fw-backend nft|iptables` 强制指定后端（默认 `auto`）。注意：使用 nft 后端时，其他工具
-（例如通过 iptables 管理规则的 Docker）设置的 `FORWARD` drop 规则不会被覆盖，这种情况请使用
-`--fw-backend iptables`。
-
-### HTTP 混淆
-
-以下两个相互独立的选项可以让伪 TCP 连接看起来像 HTTP，二者都需要配合 `--http-host` 指定 Host 头：
-
-| 选项 | 适用端 | 作用 |
-|------|--------|------|
-| `--fake-http` | 仅客户端 | 收到 SYN + ACK 后发送 `--fake-repeat`（默认 2）个 HTTP 请求诱饵包，其 TTL 只能存活 `--fake-ttl`（默认 3）跳，让路径上的中间设备看到 HTTP 请求 |
-| `--http-handshake` | 两端都要开启 | TCP 握手后，客户端发送真实的 HTTP 请求，并等待服务端的 HTTP 响应后才开始转发 UDP 流量。这两个包由 Phantun 消费，不会被转发 |
-
-关于 `--fake-ttl` 的取值：真正到达服务端的诱饵包在握手阶段会被忽略，因此它只需大于流量检测发生的
-跳数即可。让它小于到服务端的跳数，可以避免一种罕见情况：被乱序的诱饵包在握手完成后才到达，
-被当作垃圾 UDP 数据报转发出去。
-
-```
-RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote 127.0.0.1:1234 --http-handshake
-RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 \
+# 客户端
+RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --iface eth0 \
     --http-host www.example.com --fake-http --http-handshake
 ```
 
-[返回目录](#目录)
+不使用 `--iface` 时，需要像原版一样手动开启 IP 转发并配置 NAT 规则，见[原版 README 的 Usage 一节](https://github.com/dndx/phantun#usage)。
+这种情况下可以用 `setcap cap_net_admin=+pe` 以非 root 用户运行。
 
-### 断线自动重连
+日志级别由环境变量 `RUST_LOG` 控制（`error` / `warn` / `info` / `debug`）。
 
-客户端位于 NAT 之后且公网 IP（或 NAT 映射）发生变化时，旧的伪 TCP 连接会失效。客户端在收不到服务端任何数据
-15–25 秒（随机）后，会按 Linux 内核 TCP keepalive 的格式发送探测包（不带载荷、序号比当前小 1 的 ACK），
-每隔 3–6 秒（随机）一个，连续 3 个都没有应答就关闭连接，从失效到判定断线共需 24–43 秒。
-关闭连接后客户端不会主动重连，而是由下一个 UDP 包触发新的握手；如果本地应用持续有流量（如开启了 PersistentKeepalive 的
-WireGuard），判定断线后约一个 RTT 即可恢复，没有流量时则在下次有流量时才建立连接。
+## 参数说明
 
-服务端对收到的每个空 ACK 都会立即回复一个 ACK（客户端从不回复），因此即使最后的数据包丢失、两端序号不一致，
-探测也能得到应答。服务端无需额外配置，但两端都必须使用包含此功能的版本重新编译。
+带 ★ 的是本修改版新增的参数。所有参数都可以用 `-h` 查看。
 
-[返回目录](#目录)
+### 客户端 phantun_client
 
-## MTU 开销
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-l, --local <IP:PORT>` | 必填 | 本地监听 UDP 的地址和端口。IPv6 写作 `[::1]:1234` |
+| `-r, --remote <IP 或域名:PORT>` | 必填 | Phantun 服务端的地址和端口，支持域名（A / AAAA 记录） |
+| `--tun <名称>` | 自动分配 | TUN 接口名称，例如 `tun0` |
+| `--tun-local <IP>` | `192.168.200.1` | TUN 接口本机端（操作系统侧）IPv4 地址 |
+| `--tun-peer <IP>` | `192.168.200.2` | TUN 接口对端（Phantun 侧）IPv4 地址，即 Phantun 发包使用的源地址 |
+| `--tun-local6 <IP>` | `fcc8::1` | TUN 接口本机端 IPv6 地址 |
+| `--tun-peer6 <IP>` | `fcc8::2` | TUN 接口对端 IPv6 地址 |
+| `-4, --ipv4-only` | 关 | 解析 `--remote` 时只用 IPv4 地址；不能与 `--tun-local6` / `--tun-peer6` 同用 |
+| `--handshake-packet <文件>` | 无 | TCP 握手后把该文件内容作为第一个数据包发给服务端（单包发送，不能超过 MTU） |
+| ★ `--iface <网卡>` | 无 | 面向互联网的网卡。指定后自动开启 IP 转发、添加 MASQUERADE 规则，退出时删除。需要 root |
+| ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | 防火墙后端，`auto` 表示有 `nft` 命令就用 nft。必须配合 `--iface` |
+| ★ `--http-host <主机名>` | 无 | HTTP 请求中的 `Host` 头，`--fake-http` 和 `--http-handshake` 都需要它 |
+| ★ `--fake-http` | 关 | 收到 SYN+ACK 后发送有限 TTL 的 HTTP 请求诱饵包。需要 `--http-host` |
+| ★ `--fake-ttl <1-254>` | `3` | 诱饵包离开本机后还能存活的跳数 |
+| ★ `--fake-repeat <N>` | `2` | 每个连接发送的诱饵包数量 |
+| ★ `--http-handshake` | 关 | TCP 握手后与服务端交换真实的 HTTP 请求/响应，再转发 UDP。服务端也必须开启。需要 `--http-host` |
 
-Phantun 力求把隧道开销降到最低。与普通 UDP 包相比（以 IPv4 为例）：
+### 服务端 phantun_server
 
-**普通 UDP 包：** `20 字节 IP 头 + 8 字节 UDP 头 = 28 字节`
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `-l, --local <PORT>` | 必填 | 接受客户端 TCP 连接的端口 |
+| `-r, --remote <IP 或域名:PORT>` | 必填 | UDP 转发目标的地址和端口，支持域名 |
+| `--tun <名称>` | 自动分配 | TUN 接口名称 |
+| `--tun-local <IP>` | `192.168.201.1` | TUN 接口本机端 IPv4 地址 |
+| `--tun-peer <IP>` | `192.168.201.2` | TUN 接口对端 IPv4 地址，即 DNAT 的目标地址 |
+| `--tun-local6 <IP>` | `fcc9::1` | TUN 接口本机端 IPv6 地址 |
+| `--tun-peer6 <IP>` | `fcc9::2` | TUN 接口对端 IPv6 地址，即 IPv6 DNAT 的目标地址 |
+| `-4, --ipv4-only` | 关 | 不给 TUN 接口分配 IPv6 地址（`--iface` 也只添加 IPv4 规则） |
+| `--handshake-packet <文件>` | 无 | TCP 握手后把该文件内容作为第一个数据包发给客户端 |
+| ★ `--iface <网卡>` | 无 | 面向互联网的网卡。指定后自动开启 IP 转发、添加 DNAT 规则，退出时删除。需要 root |
+| ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | 同客户端 |
+| ★ `--http-handshake` | 关 | 用 HTTP 响应回答开启了 `--http-handshake` 的客户端发来的 HTTP 请求，而不是把它当 UDP 转发 |
 
-**混淆后的包：** `20 字节 IP 头 + 20 字节 TCP 头 = 40 字节`
+## 功能详解
 
-为了穿过有状态包检测，Phantun 除 IP 和 TCP 头外不添加任何额外头部！
+### 自动管理防火墙规则（--iface）
 
-Phantun 的额外开销为 `12 字节`，即使用 Phantun 时 UDP 可用载荷减少 12 字节。这是此类混淆所能达到的最小开销。
+指定 `--iface` 后，Phantun 启动时会：
 
-![Packet header diagram](images/packet-headers.png)
+1. 把 `/proc/sys/net/ipv4/ip_forward` 置为 1（使用 IPv6 时还会设置 `net.ipv6.conf.all.forwarding`）；
+2. 添加 NAT 规则：
+    * 客户端：从 TUN 进、从 `--iface` 出的流量做 MASQUERADE；
+    * 服务端：从 `--iface` 进、目标端口为 `--local` 的 TCP 流量 DNAT 到 `--tun-peer`（及 `--tun-peer6`）。
 
-### WireGuard 的 MTU 计算
+收到 `SIGINT` / `SIGTERM` 退出时删除这些规则（IP 转发开关保持不变）。如果进程被 `kill -9` 等方式强杀导致规则残留，
+下次启动时会先清理旧规则再添加，不会重复。
 
-使用 Phantun 承载 [WireGuard®](https://www.wireguard.com) UDP 流量时，可按以下公式计算 WireGuard 接口的 MTU：
+| 后端 | 规则存放位置 | 备注 |
+|------|--------------|------|
+| nft | 独立的 `inet phantun_<TUN 名>` 表 | 不影响其他表中的规则 |
+| iptables / ip6tables | 带 `phantun_<TUN 名>` 注释的规则 | 额外在 `FORWARD` 链插入对 TUN 接口的 ACCEPT 规则 |
 
-```
-WireGuard MTU = 链路 MTU - IPv4 头 (20 字节) - TCP 头 (20 字节) - WireGuard 开销 (32 字节)
-```
+使用 nft 后端时，其他工具（例如通过 iptables 管理规则的 Docker）设置的 `FORWARD` drop 规则不会被绕过，
+这种情况请使用 `--fw-backend iptables`。
 
-或
+### HTTP 伪装（--fake-http / --http-handshake）
 
-```
-WireGuard MTU = 链路 MTU - IPv6 头 (40 字节) - TCP 头 (20 字节) - WireGuard 开销 (32 字节)
-```
+两个选项相互独立，可以单独或同时使用：
 
-例如链路 MTU 为 1500 字节时，WireGuard 接口 MTU 应设置为：
+**`--fake-http`（仅客户端）**：客户端收到 SYN+ACK 后，发送 `--fake-repeat` 个 HTTP `GET` 请求诱饵包，
+这些包的 TTL 只够存活 `--fake-ttl` 跳。路径上的检测设备会看到一个 HTTP 请求，而诱饵包通常在到达服务端之前就被丢弃。
+即使有诱饵包到达服务端，握手阶段也会被忽略。
 
-**IPv4：** `1500（链路 MTU）- 20 - 20 - 32 = 1428 字节`
+`--fake-ttl` 的取值：只需大于检测设备所在的跳数即可。建议小于到服务端的跳数（可以用 `traceroute` 查看），
+以避免一种罕见情况：被乱序的诱饵包在握手完成后才到达，被当作垃圾 UDP 包转发出去。
 
-**IPv6：** `1500（链路 MTU）- 40 - 20 - 32 = 1408 字节`
+**`--http-handshake`（两端）**：TCP 握手完成后，客户端发送一个真实的 HTTP 请求，服务端回复
+`HTTP/1.1 200 OK`，之后才开始转发 UDP。客户端等待响应 1 秒，超时重发，最多 3 次，仍失败则放弃该连接。
+这两个包由 Phantun 自己消费，不会转发给 UDP 应用。
 
-这样生成的 Phantun TCP 数据包为 1500 字节，不会超过接口 MTU。
+> 注意：`--http-handshake` 两端必须同时开启或同时关闭。只开客户端会导致握手失败；只开服务端则客户端的数据照常转发，但不会有 HTTP 交换。
 
-请注意，**数据包大小超过链路 MTU 时 Phantun 无法正常工作**，因为 Phantun 不做 IP 分片与重组。
-出于同样原因，Phantun 总是在 IP 头中设置 `DF`（Don't Fragment）位，防止中间设备对数据包分片。
+### 断线检测与自动重连
 
-*强烈建议* WireGuard 隧道两端使用相同的接口 MTU，否则可能出现难以排查的丢包问题。
+客户端在 NAT 后面、公网 IP 或 NAT 映射变化后，旧的伪 TCP 连接会失效：严格的 NAT 会直接丢弃中途出现的包，服务端不会回 RST；
+而原版的空闲计时器会被客户端自己发出的流量刷新，因此客户端会一直使用这个已失效的连接。
 
-[返回目录](#目录)
+本修改版的客户端在 **15–25 秒（随机）** 收不到服务端任何数据后，每隔 **3–6 秒（随机）** 发送一个 keepalive 探测包，
+**连续 3 个**都没有应答就关闭连接。从连接失效到判定断线共约 24–43 秒。
 
-## 版本兼容性
+* 客户端不会主动重连，而是由下一个 UDP 包触发新的握手。如果本地应用持续有流量（例如开启了 `PersistentKeepalive`
+  的 WireGuard），判定断线后约一个 RTT 就能恢复。
+* 客户端只有收到携带载荷的包才会刷新 180 秒的空闲超时，因此 keepalive 本身不会让空闲连接永远不关闭。
+* 服务端对每个空 ACK 立即回复，即使两端序号已不一致也能应答。服务端无需任何配置。
 
-虽然 TCP 协议栈相当稳定，但建议两端运行相同 minor 版本的 Phantun 服务端/客户端，以确保最佳兼容性。
+## 注意事项
 
-## 开发文档
+* **MTU**：Phantun 不做分片，并总是设置 `DF` 位，包长不能超过链路 MTU。承载 WireGuard 时，WireGuard 接口 MTU
+  可按 `链路 MTU - IP 头(IPv4 20 / IPv6 40) - TCP 头 20 - WireGuard 开销 32` 计算，例如 1500 的链路用 IPv4 时设为 `1428`。
+  使用 `--handshake-packet` 时文件大小同样不能超过 MTU。
+* **无加密**：Phantun 只做伪装，不提供加密和防重放，请在上层使用 WireGuard 等加密协议。
+* **只能穿过 L3/L4 设备**：无法穿过 HTTP 代理等 L7 代理，HTTP 伪装只是让流量“看起来像”HTTP。
+* **权限**：`--iface` 需要 root；不使用 `--iface` 时只需 `cap_net_admin`。
 
-如需在自己的项目中使用 `fake-tcp` 库，请参阅：[https://docs.rs/fake-tcp](https://docs.rs/fake-tcp)。
+## 许可证与致谢
 
-## 性能
+原项目作者 Datong Sun（[dndx/phantun](https://github.com/dndx/phantun)），原项目以 MIT 或 Apache-2.0 双许可证发布。
+本修改版选择其中的 [MIT 许可证](LICENSE-MIT) 发布。
 
-测试环境为两台 AWS `t4g.xlarge` 实例（4 vCPU，5 Gb/s 网卡，局域网）。使用 `nftables` 把 `iperf3` 的
-UDP 流量重定向到两台实例之间的 Phantun/udp2raw 隧道，并调整 MTU 以避免分片。
-
-测试版本为 Phantun `v0.3.2` 和 `udp2raw_arm_asm_aes` `20200818.0`，均为 2022 年 4 月时的最新版本。
-
-测试命令：`iperf3 -c <IP> -p <PORT> -R -u -l 1400 -b 1000m -t 30 -P 5`
-
-| 模式                                                                        | 发送速率       | 接收速率       | 总 CPU 占用                             |
-|-----------------------------------------------------------------------------|----------------|----------------|-----------------------------------------|
-| 直连（1 条流）                                                              | 3.00 Gbits/sec | 2.37 Gbits/sec | 25%（1 核 100%）                        |
-| Phantun（1 条流）                                                           | 1.30 Gbits/sec | 1.20 Gbits/sec | 60%（1 核 100%，3 核 50%）              |
-| udp2raw（`cipher-mode=none` `auth-mode=none` `disable-anti-replay`）（1 条流） | 1.30 Gbits/sec | 715 Mbits/sec  | 40%（1 核 100%，1 核 50%，2 核空闲）    |
-| 直连（5 条流）                                                              | 5.00 Gbits/sec | 3.64 Gbits/sec | 25%（1 核 100%）                        |
-| Phantun（5 条流）                                                           | 5.00 Gbits/sec | 2.38 Gbits/sec | 95%（所有核心均被利用）                 |
-| udp2raw（`cipher-mode=none` `auth-mode=none` `disable-anti-replay`）（5 条流） | 5.00 Gbits/sec | 770 Mbits/sec  | 50%（2 核 100%）                        |
-
-关于 Phantun 达到这一性能所用的部分技术，可参阅：[Writing Highly Efficient UDP Server in Rust](https://idndx.com/writing-highly-efficient-udp-server-in-rust/)。
-
-[返回目录](#目录)
-
-## 未来计划
-
-* 将单条 UDP 流负载均衡到多条 TCP 流
-* 集成测试
-
-## 与 udp2raw 的对比
-
-[udp2raw](https://github.com/wangyu-/udp2raw-tunnel) 是 [@wangyu-](https://github.com/wangyu-) 开发的另一个流行项目，
-功能与 Phantun 非常相似，Phantun 的灵感也来自它。开发 Phantun 的主要原因是 udp2raw 的性能不足
-（尤其在树莓派等多核系统上）。不过 Phantun 的目标从来不是像 udp2raw 那样功能齐全，而是只支持最常见的场景：
-不支持 UDP over ICMP 和 UDP over UDP 模式，也没有防重放和加密。换来的是整体性能更好，并且由于 TCP 载荷中
-没有额外头部，MTU 开销更小。
-
-以下对比可帮助你选择：
-
-|                                    |    Phantun    |      udp2raw      |
-|------------------------------------|:-------------:|:-----------------:|
-| UDP over FakeTCP 混淆              |       ✅       |         ✅         |
-| UDP over ICMP 混淆                 |       ❌       |         ✅         |
-| UDP over UDP 混淆                  |       ❌       |         ✅         |
-| 多线程                             |       ✅       |         ❌         |
-| 吞吐量                             |      更好     |        好         |
-| 三层实现方式                       |   TUN 接口    | Raw sockets + BPF |
-| 隧道 MTU 开销                      |    12 字节    |      44 字节      |
-| 每个 UDP 连接使用独立 TCP 连接     |  客户端/服务端 |     仅服务端      |
-| 防重放、加密                       |       ❌       |         ✅         |
-| IPv6                               |       ✅       |         ✅         |
-
-[返回目录](#目录)
-
-## 许可证
-
-Copyright 2021-2025 Datong Sun (dndx@idndx.com)
-
-本项目可按你的选择，依据 Apache License 2.0（[LICENSE-APACHE](LICENSE-APACHE) 或
-[https://www.apache.org/licenses/LICENSE-2.0](https://www.apache.org/licenses/LICENSE-2.0)）
-或 MIT 许可证（[LICENSE-MIT](LICENSE-MIT) 或 [https://opensource.org/licenses/MIT](https://opensource.org/licenses/MIT)）授权。
-未遵守上述条款，不得复制、修改或分发本项目中的文件。
-
-**[⬆ 返回顶部](#phantun)**
+**[⬆ 返回顶部](#phantun-mod)**
 
 ---
 
@@ -391,416 +213,222 @@ Copyright 2021-2025 Datong Sun (dndx@idndx.com)
 
 ## Table of Contents
 
-* [Latest release](#latest-release)
-* [Overview](#overview)
-* [Usage](#usage)
-    * [1. Enable kernel IP forwarding](#1-enable-kernel-ip-forwarding)
-    * [2. Add required firewall rules](#2-add-required-firewall-rules)
-        * [Client SNAT rules](#client-snat-rules)
-        * [Server DNAT rules](#server-dnat-rules)
-    * [3. Run Phantun binaries as non-root (Optional)](#3-run-phantun-binaries-as-non-root-optional)
-    * [4. Start Phantun daemon](#4-start-phantun-daemon)
-        * [Start the server](#start-the-server)
-        * [Start the client](#start-the-client)
-    * [Automatic firewall rules](#automatic-firewall-rules)
-    * [HTTP obfuscation](#http-obfuscation)
-    * [Automatic reconnection](#automatic-reconnection)
-* [MTU overhead](#mtu-overhead)
-    * [MTU calculation for WireGuard](#mtu-calculation-for-wireguard)
-* [Version compatibility](#version-compatibility)
-* [Documentation](#documentation)
-* [Performance](#performance)
-* [Future plans](#future-plans)
-* [Comparison to udp2raw](#comparison-to-udp2raw)
-* [License](#license)
+* [Introduction](#introduction)
+* [Changes from upstream](#changes-from-upstream)
+* [Build and install](#build-and-install)
+* [Quick start](#quick-start)
+* [Options](#options)
+    * [Client: phantun_client](#client-phantun_client)
+    * [Server: phantun_server](#server-phantun_server)
+* [Features in detail](#features-in-detail)
+    * [Automatic firewall rules (--iface)](#automatic-firewall-rules---iface)
+    * [HTTP obfuscation (--fake-http / --http-handshake)](#http-obfuscation---fake-http----http-handshake)
+    * [Dead connection detection and reconnection](#dead-connection-detection-and-reconnection)
+* [Notes](#notes)
+* [License and credits](#license-and-credits)
 
-## Latest release
+## Introduction
 
-[v0.8.1](https://github.com/dndx/phantun/releases/tag/v0.8.1)
+Phantun turns a stream of UDP packets into a fake TCP connection, for networks where UDP is blocked
+or throttled but TCP gets through. It only puts an IP + TCP header in front of each UDP payload, with
+no retransmission or flow control, so UDP properties such as out-of-order delivery are kept and the
+overhead is only 12 bytes. For the design, benchmarks and comparison with udp2raw, see the
+[upstream README](https://github.com/dndx/phantun#readme).
 
-<details>
-  <summary>MIPS architecture support for Phantun</summary>
+This fork is based on upstream v0.8.1 and addresses three practical pain points:
 
-  [Rust only provides Tier 3 supports for MIPS based platforms](https://github.com/rust-lang/compiler-team/issues/648)
-since 2023. Phantun's MIPS builds are therefore built using nightly Rust toolchain and provided on a best effort basis only.
-</details>
+1. Every deployment needs hand-written iptables/nftables rules and IP forwarding turned on;
+2. Binary data right after a bare TCP handshake is easy to flag as unusual traffic;
+3. When the client is behind NAT and its public IP changes, the old connection dies silently and the
+   client never notices.
 
-## Overview
+## Changes from upstream
 
-Phantun is a project that obfuscates UDP packets into TCP connections. It aims to
-achieve maximum performance with minimum processing and encapsulation overhead.
+| Change | Side | Options | Description |
+|--------|------|---------|-------------|
+| Automatic firewall rules | Client, server | `--iface`, `--fw-backend` | Enables IP forwarding and adds MASQUERADE / DNAT rules on startup, removes them on exit |
+| HTTP decoys | Client only | `--fake-http`, `--fake-ttl`, `--fake-repeat`, `--http-host` | Sends HTTP request packets that survive only a few hops during the handshake, so middleboxes see HTTP |
+| HTTP handshake | Both sides | `--http-handshake`, `--http-host` | Exchanges a real HTTP request/response after the TCP handshake, before forwarding UDP |
+| Keepalive | Client probes, server answers | None (always on) | When the server has been silent for a while, the client sends probes; if none is answered, the connection is closed and the next UDP packet makes a new one |
+| Graceful shutdown | Client, server | None | Exits cleanly on `SIGINT` / `SIGTERM` (so firewall rules can be removed) |
 
-It is commonly used in environments where UDP is blocked/throttled but TCP is allowed through.
+Matching changes in the `fake-tcp` library:
 
-Phantun simply converts a stream of UDP packets into obfuscated TCP stream packets. The TCP stack
-used by Phantun is designed to pass through most L3/L4 stateful/stateless firewalls/NAT
-devices. It will **not** be able to pass through L7 proxies.
-However, the advantage of this approach is that none of the common UDP over TCP performance killers
-such as retransmissions and flow control will occur. The underlying UDP properties such as
-out-of-order delivery are fully preserved even if the connection ends up looking like a TCP
-connection from the perspective of firewalls/NAT devices.
+* New `Stack::set_fake_packet()` and `build_tcp_packet_with_ttl()` to send packets with a given TTL;
+* New `Socket::send_keepalive()`, which sends a probe in the same format as the Linux kernel's TCP
+  keepalive (an empty ACK one byte behind the current sequence number);
+* Empty ACKs no longer move `ack`. Server (accepted) sockets answer every empty ACK with an ACK;
+  client sockets never answer, so there is no ACK loop;
+* Fixed a possible panic in `Socket::drop` on shutdown.
 
-Phantun means Phantom TUN, as it is an obfuscator for UDP traffic that does just enough work
-to make it pass through stateful firewall/NATs as TCP packets.
+## Build and install
 
-Phantun is written in 100% safe Rust. It has been optimized extensively to scale well on multi-core
-systems and has no issue saturating all available CPU resources on a fast connection.
-See the [Performance](#performance) section for benchmarking results.
+Requires a Rust toolchain. Runs on Linux only (it needs a TUN device).
 
-![Phantun benchmark results](images/phantun-vs-udp2raw-benchmark-result.png)
-![Traffic flow diagram](images/traffic-flow.png)
-
-## Usage
-
-For the example below, it is assumed that:
-
-* **Phantun Server** listens for incoming Phantun Client connections at port `4567` (the `--local`
-  option for server), and forwards UDP packets to the UDP server at `127.0.0.1:1234` (the `--remote`
-  option for server).
-* **Phantun Client** listens for incoming UDP packets at `127.0.0.1:1234` (the `--local` option for
-  client) and connects to Phantun Server at `10.0.0.1:4567` (the `--remote` option for client).
-
-Phantun creates a TUN interface for both the Client and Server. For **Client**, Phantun assigns itself the IP address
-`192.168.200.2` and `fcc8::2` by default.
-For **Server**, it assigns `192.168.201.2` and `fcc9::2` by default. Therefore, your kernel must have
-IPv4/IPv6 forwarding enabled and set up appropriate iptables/nftables rules for NAT between your physical
-NIC address and Phantun's TUN interface address.
-
-You may customize the name of the TUN interface created by Phantun and the assigned addresses. Please
-run the executable with the `-h` option to see how to change them.
-
-Another way to help understand this network topology (please see the diagram above for an illustration of this topology):
-
-* Phantun Client is like a machine with private IP address (`192.168.200.2`/`fcc8::2`) behind a router.
-  In order for it to reach the Internet, you will need to SNAT the private IP address before its traffic
-  leaves the NIC.
-* Phantun Server is like a server with private IP address (`192.168.201.2`/`fcc9::2`) behind a router.
-  In order to access it from the Internet, you need to `DNAT` its listening port on the router
-  and change the destination IP address to where the server is listening for incoming connections.
-
-In those cases, the machine/iptables running Phantun acts as the "router" that allows Phantun
-to communicate with outside using its private IP addresses.
-
-As of Phantun v0.4.1, IPv6 is fully supported for both TCP and UDP sides.
-To specify an IPv6 address, use the following format: `[::1]:1234` with
-the command line options. Resolving AAAA records is also supported. Please run the program
-with `-h` to see detailed options on how to control the IPv6 behavior.
-
-> **Tip:** When running as root, you can skip steps 1 and 2 and let Phantun configure them with
-> `--iface`. See [Automatic firewall rules](#automatic-firewall-rules).
-
-### 1. Enable kernel IP forwarding
-
-Edit `/etc/sysctl.conf`, add `net.ipv4.ip_forward=1` and run `sudo sysctl -p /etc/sysctl.conf`.
-
-<details>
-  <summary>IPv6 specific config</summary>
-
-  `net.ipv6.conf.all.forwarding=1` will need to be set as well.
-</details>
-
-### 2. Add required firewall rules
-
-#### Client SNAT rules
-
-Client simply needs SNAT enabled on the physical interface to translate Phantun's address into
-one that can be used on the physical network. This can be done simply with masquerade.
-
-Note: change `eth0` to whatever the actual physical interface name is.
-
-**Using nftables:**
-
-```
-table inet nat {
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-        iifname tun0 oif eth0 masquerade
-    }
-}
+```bash
+cargo build --release
+sudo install target/release/client /usr/local/bin/phantun_client
+sudo install target/release/server /usr/local/bin/phantun_server
 ```
 
-Note: The above rule uses `inet` as the table family type, so it is compatible with
-both IPv4 and IPv6 usage.
+> **Both client and server must run this fork.** The upstream server does not answer keepalive
+> probes and does not understand the HTTP handshake.
 
-**Using iptables:**
+## Quick start
 
-```
-iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-```
+The examples assume the server's public address is `10.0.0.1`, it accepts connections on TCP port
+`4567` and forwards UDP to `127.0.0.1:1234` on the same host (e.g. WireGuard); the client receives
+local UDP on `127.0.0.1:1234`. The Internet facing interface on both hosts is `eth0`.
 
-#### Server DNAT rules
+**Minimal setup** (run as root, firewall rules are fully automatic):
 
-Server needs to DNAT the TCP listening port to Phantun's TUN interface address.
+```bash
+# Server
+RUST_LOG=info phantun_server --local 4567 --remote 127.0.0.1:1234 --iface eth0
 
-Note: change `eth0` to whatever the actual physical interface name is and `4567` to the
-actual TCP port number used by Phantun server.
-
-**Using nftables:**
-
-```
-table inet nat {
-    chain prerouting {
-        type nat hook prerouting priority dstnat; policy accept;
-        iif eth0 tcp dport 4567 dnat ip to 192.168.201.2
-        iif eth0 tcp dport 4567 dnat ip6 to fcc9::2
-    }
-}
+# Client
+RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --iface eth0
 ```
 
-**Using iptables:**
+**With HTTP obfuscation**:
 
-```
-iptables -t nat -A PREROUTING -p tcp -i eth0 --dport 4567 -j DNAT --to-destination 192.168.201.2
-ip6tables -t nat -A PREROUTING -p tcp -i eth0 --dport 4567 -j DNAT --to-destination fcc9::2
-```
+```bash
+# Server
+RUST_LOG=info phantun_server --local 4567 --remote 127.0.0.1:1234 --iface eth0 --http-handshake
 
-### 3. Run Phantun binaries as non-root (Optional)
-
-It is ill-advised to run network facing applications as root user. Phantun can be run fully
-as non-root user with the `cap_net_admin` capability.
-
-```
-sudo setcap cap_net_admin=+pe phantun_server
-sudo setcap cap_net_admin=+pe phantun_client
-```
-
-Note: [Automatic firewall rules](#automatic-firewall-rules) (`--iface`) require running as root.
-
-### 4. Start Phantun daemon
-
-**Note:** Run Phantun executable with `-h` option to see full detailed options.
-
-#### Start the server
-
-Note: `4567` is the TCP port Phantun should listen on and must correspond to the DNAT
-rule specified above. `127.0.0.1:1234` is the UDP Server to connect to for new connections.
-
-```
-RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote 127.0.0.1:1234
-```
-
-Or use host name with `--remote`:
-
-```
-RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote example.com:1234
-```
-
-Note: Server by default assigns both IPv4 and IPv6 private address to the TUN interface.
-If you do not wish to use IPv6, you can simply skip creating the IPv6 DNAT rule above and
-the presence of IPv6 address on the TUN interface should have no side effect to the server.
-
-#### Start the client
-
-Note: `127.0.0.1:1234` is the UDP address and port Phantun should listen on. `10.0.0.1:4567` is
-the Phantun Server to connect.
-
-```
-RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567
-```
-
-Or use host name with `--remote`:
-
-```
-RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote example.com:4567
-```
-
-<details>
-  <summary>IPv6 specific config</summary>
-
-  ```
-  RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote [fdxx::1234]:4567
-  ```
-
-  Domain name with AAAA record is also supported.
-</details>
-
-### Automatic firewall rules
-
-Instead of following steps 1 and 2 manually, pass the Internet facing interface with `--iface`.
-Phantun then enables IP forwarding, adds the required MASQUERADE (client) or DNAT (server) rules
-on startup, and removes them when it exits on `SIGINT`/`SIGTERM`. Rules left behind by a killed
-process are replaced on the next start. Running as root is required for this option.
-
-```
-RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote 127.0.0.1:1234 --iface eth0
-RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --iface eth0
-```
-
-| Backend | Where the rules live |
-|---------|----------------------|
-| nft (preferred when available) | A dedicated `inet phantun_<tun>` table |
-| iptables/ip6tables | Rules tagged with comment `phantun_<tun>` |
-
-Use `--fw-backend nft|iptables` to force one (default: `auto`). Note that with the nft backend,
-`FORWARD` drop rules managed by other tools (e.g. Docker via iptables) are not overridden; use
-`--fw-backend iptables` in that case.
-
-### HTTP obfuscation
-
-Two independent options make the fake TCP connection look like HTTP. Both require `--http-host`
-to set the `Host` header:
-
-| Option | Side | Effect |
-|--------|------|--------|
-| `--fake-http` | Client only | After receiving SYN + ACK, sends `--fake-repeat` (default 2) HTTP request decoys whose TTL lets them survive only `--fake-ttl` (default 3) hops, so middleboxes on the path see an HTTP request |
-| `--http-handshake` | Both sides | After TCP handshake, the client sends a real HTTP request and waits for the server's HTTP response before forwarding any UDP traffic. Both packets are consumed by Phantun and never forwarded |
-
-On choosing `--fake-ttl`: decoys that do reach the server are ignored during the handshake, so
-`--fake-ttl` only needs to exceed the hop at which inspection happens. Keeping it below the hop
-count to the server avoids a rare case where a reordered decoy arrives after the handshake and
-gets forwarded as a junk UDP datagram.
-
-```
-RUST_LOG=info /usr/local/bin/phantun_server --local 4567 --remote 127.0.0.1:1234 --http-handshake
-RUST_LOG=info /usr/local/bin/phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 \
+# Client
+RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --iface eth0 \
     --http-host www.example.com --fake-http --http-handshake
 ```
 
-[Back to TOC](#table-of-contents)
+Without `--iface`, turn on IP forwarding and set up the NAT rules by hand as with upstream; see the
+[Usage section of the upstream README](https://github.com/dndx/phantun#usage). In that case Phantun
+can run as a non-root user with `setcap cap_net_admin=+pe`.
 
-### Automatic reconnection
+The log level is set with the `RUST_LOG` environment variable (`error` / `warn` / `info` / `debug`).
 
-When the client is behind NAT and its public IP (or NAT mapping) changes, the old fake TCP
-connection stops working. After 15–25 seconds (random) without anything from the server, the
-client sends keepalive probes formatted like the Linux kernel's TCP keepalive (an empty ACK one
-byte behind the current sequence number), one every 3–6 seconds (random). If none of 3 probes is
-answered, the connection is closed, 24–43 seconds after it stopped working in total.
+## Options
 
-The client does not reconnect by itself: the next UDP packet starts a new handshake. If the local
-application keeps sending (e.g. WireGuard with PersistentKeepalive), the connection recovers about
-one RTT after being declared dead; otherwise a new one is made when traffic resumes.
+Options marked with ★ are new in this fork. Run with `-h` to list all options.
 
-The server answers every empty ACK it receives with an ACK right away (the client never answers),
-so probes are answered even if the last data packet was lost and sequence numbers no longer match.
-No server configuration is needed, but both ends must be rebuilt with this feature.
+### Client: phantun_client
 
-[Back to TOC](#table-of-contents)
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-l, --local <IP:PORT>` | Required | Address and port to listen on for UDP. IPv6 is written as `[::1]:1234` |
+| `-r, --remote <IP or HOST:PORT>` | Required | Address and port of the Phantun server; host names (A / AAAA records) are supported |
+| `--tun <NAME>` | Picked by kernel | TUN interface name, e.g. `tun0` |
+| `--tun-local <IP>` | `192.168.200.1` | IPv4 address of the OS end of the TUN interface |
+| `--tun-peer <IP>` | `192.168.200.2` | IPv4 address of the Phantun end of the TUN interface, i.e. the source address of Phantun's packets |
+| `--tun-local6 <IP>` | `fcc8::1` | IPv6 address of the OS end of the TUN interface |
+| `--tun-peer6 <IP>` | `fcc8::2` | IPv6 address of the Phantun end of the TUN interface |
+| `-4, --ipv4-only` | Off | Use only IPv4 addresses when resolving `--remote`; cannot be used with `--tun-local6` / `--tun-peer6` |
+| `--handshake-packet <FILE>` | None | After the TCP handshake, send the content of this file to the server as the first data packet (sent as one packet, must fit in the MTU) |
+| ★ `--iface <IFACE>` | None | Internet facing interface. When set, enables IP forwarding and adds MASQUERADE rules, removed on exit. Requires root |
+| ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | Firewall backend; `auto` uses nft when the `nft` command is available. Requires `--iface` |
+| ★ `--http-host <HOST>` | None | `Host` header of the HTTP request, required by `--fake-http` and `--http-handshake` |
+| ★ `--fake-http` | Off | After receiving SYN+ACK, send HTTP request decoys with a limited TTL. Requires `--http-host` |
+| ★ `--fake-ttl <1-254>` | `3` | Number of hops the decoys survive after leaving this host |
+| ★ `--fake-repeat <N>` | `2` | Number of decoys sent per connection |
+| ★ `--http-handshake` | Off | After the TCP handshake, exchange a real HTTP request/response with the server before forwarding UDP. The server must enable it too. Requires `--http-host` |
 
-## MTU overhead
+### Server: phantun_server
 
-Phantun aims to keep tunneling overhead to the minimum. The overhead compared to a plain UDP packet
-is the following (using IPv4 below as an example):
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-l, --local <PORT>` | Required | Port to accept client TCP connections on |
+| `-r, --remote <IP or HOST:PORT>` | Required | Address and port to forward UDP to; host names are supported |
+| `--tun <NAME>` | Picked by kernel | TUN interface name |
+| `--tun-local <IP>` | `192.168.201.1` | IPv4 address of the OS end of the TUN interface |
+| `--tun-peer <IP>` | `192.168.201.2` | IPv4 address of the Phantun end of the TUN interface, i.e. the DNAT target |
+| `--tun-local6 <IP>` | `fcc9::1` | IPv6 address of the OS end of the TUN interface |
+| `--tun-peer6 <IP>` | `fcc9::2` | IPv6 address of the Phantun end of the TUN interface, i.e. the IPv6 DNAT target |
+| `-4, --ipv4-only` | Off | Do not assign IPv6 addresses to the TUN interface (`--iface` then adds IPv4 rules only) |
+| `--handshake-packet <FILE>` | None | After the TCP handshake, send the content of this file to the client as the first data packet |
+| ★ `--iface <IFACE>` | None | Internet facing interface. When set, enables IP forwarding and adds DNAT rules, removed on exit. Requires root |
+| ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | Same as the client |
+| ★ `--http-handshake` | Off | Answer the HTTP request from a client started with `--http-handshake` with an HTTP response instead of forwarding it as UDP |
 
-**Standard UDP packet:** `20 byte IP header + 8 byte UDP header = 28 bytes`
+## Features in detail
 
-**Obfuscated packet:** `20 byte IP header + 20 byte TCP header = 40 bytes`
+### Automatic firewall rules (--iface)
 
-Note that Phantun does not add any additional header other than IP and TCP headers in order to pass through
-stateful packet inspection!
+With `--iface`, Phantun does the following on startup:
 
-Phantun's additional overhead: `12 bytes`. In other words, when using Phantun, the usable payload for
-UDP packet is reduced by 12 bytes. This is the minimum overhead possible when doing such kind
-of obfuscation.
+1. Sets `/proc/sys/net/ipv4/ip_forward` to 1 (and `net.ipv6.conf.all.forwarding` when IPv6 is used);
+2. Adds NAT rules:
+    * Client: MASQUERADE traffic coming from the TUN interface and leaving through `--iface`;
+    * Server: DNAT TCP traffic arriving on `--iface` with destination port `--local` to `--tun-peer`
+      (and `--tun-peer6`).
 
-![Packet header diagram](images/packet-headers.png)
+The rules are removed when Phantun exits on `SIGINT` / `SIGTERM` (IP forwarding is left on). If the
+process was killed (e.g. `kill -9`) and left rules behind, they are cleaned up on the next start
+instead of being duplicated.
 
-### MTU calculation for WireGuard
+| Backend | Where the rules live | Notes |
+|---------|----------------------|-------|
+| nft | A dedicated `inet phantun_<TUN name>` table | Rules in other tables are untouched |
+| iptables / ip6tables | Rules tagged with comment `phantun_<TUN name>` | Also inserts ACCEPT rules for the TUN interface in the `FORWARD` chain |
 
-For people who use Phantun to tunnel [WireGuard®](https://www.wireguard.com) UDP packets, here are some guidelines on figuring
-out the correct MTU to use for your WireGuard interface.
+With the nft backend, `FORWARD` drop rules set by other tools (e.g. Docker via iptables) are not
+bypassed; use `--fw-backend iptables` in that case.
 
-```
-WireGuard MTU = Link MTU - IPv4 header (20 bytes) - TCP header (20 bytes) - WireGuard overhead (32 bytes)
-```
+### HTTP obfuscation (--fake-http / --http-handshake)
 
-or
+The two options are independent and can be used alone or together:
 
-```
-WireGuard MTU = Link MTU - IPv6 header (40 bytes) - TCP header (20 bytes) - WireGuard overhead (32 bytes)
-```
+**`--fake-http` (client only)**: after receiving SYN+ACK, the client sends `--fake-repeat` HTTP `GET`
+request decoys whose TTL lets them survive only `--fake-ttl` hops. Middleboxes on the path see an
+HTTP request, while the decoys are usually dropped before reaching the server. Decoys that do reach
+the server are ignored during the handshake.
 
-For example, for a network link with 1500 bytes MTU, the WireGuard interface MTU should be set as:
+Choosing `--fake-ttl`: it only needs to exceed the hop at which inspection happens. Keeping it below
+the hop count to the server (check with `traceroute`) avoids a rare case where a reordered decoy
+arrives after the handshake and is forwarded as a junk UDP packet.
 
-**IPv4:** `1500 (link MTU) - 20 - 20 - 32 = 1428 bytes`
+**`--http-handshake` (both sides)**: after the TCP handshake, the client sends a real HTTP request and
+the server replies with `HTTP/1.1 200 OK`; only then does UDP forwarding start. The client waits 1
+second for the response and retransmits on timeout, up to 3 times, then gives up on the connection.
+Both packets are consumed by Phantun and never forwarded to the UDP application.
 
-**IPv6:** `1500 (link MTU) - 40 - 20 - 32 = 1408 bytes`
+> Note: `--http-handshake` must be enabled or disabled on both sides. Enabling it only on the client
+> makes the handshake fail; enabling it only on the server forwards client data as usual, with no
+> HTTP exchange.
 
-The resulting Phantun TCP data packet will be 1500 bytes which does not exceed the
-interface MTU of 1500.
+### Dead connection detection and reconnection
 
-Please note **Phantun can not function correctly if
-the packet size exceeds that of the link MTU**, as Phantun does not perform any IP-fragmentation
-and reassembly. For the same reason, Phantun always sets the `DF` (Don't Fragment) bit
-in the IP header to prevent intermediate devices performing any fragmentation on the packet.
+When the client is behind NAT and its public IP or NAT mapping changes, the old fake TCP connection
+stops working: strict NATs silently drop the mid-stream packets, so the server never sends a RST,
+and upstream's idle timer is refreshed by the client's own outbound traffic, so the client keeps
+using the dead connection forever.
 
-It is also *strongly recommended* to use the same interface
-MTU for both ends of a WireGuard tunnel, or unexpected packet loss may occur and these issues are
-generally very hard to troubleshoot.
+In this fork, after **15–25 seconds (random)** without anything from the server, the client sends a
+keepalive probe every **3–6 seconds (random)**, and closes the connection if **none of 3** probes is
+answered. It takes about 24–43 seconds from the connection dying to it being closed.
 
-[Back to TOC](#table-of-contents)
+* The client does not reconnect by itself: the next UDP packet starts a new handshake. If the local
+  application keeps sending (e.g. WireGuard with `PersistentKeepalive`), the connection recovers
+  about one RTT after being declared dead.
+* On the client, only packets carrying a payload refresh the 180 second idle timeout, so keepalive alone does not
+  keep idle connections open forever.
+* The server answers every empty ACK right away, even when sequence numbers no longer match. No
+  server configuration is needed.
 
-## Version compatibility
+## Notes
 
-While the TCP stack is fairly stable, the general expectation is that you should run same minor versions
-of Server/Client of Phantun on both ends to ensure maximum compatibility.
+* **MTU**: Phantun does not fragment and always sets the `DF` bit, so packets must fit in the link
+  MTU. For WireGuard, set the interface MTU to
+  `link MTU - IP header (IPv4 20 / IPv6 40) - TCP header 20 - WireGuard overhead 32`, e.g. `1428` for
+  a 1500 link over IPv4. Files passed to `--handshake-packet` must fit in the MTU as well.
+* **No encryption**: Phantun only obfuscates; it has no encryption or anti-replay. Use an encrypted
+  protocol such as WireGuard on top.
+* **L3/L4 only**: it cannot pass through L7 proxies such as HTTP proxies. HTTP obfuscation only makes
+  the traffic *look* like HTTP.
+* **Privileges**: `--iface` requires root; without it, `cap_net_admin` is enough.
 
-## Documentation
+## License and credits
 
-For users who wish to use `fake-tcp` library inside their own project, refer to the documentation for the library at:
-[https://docs.rs/fake-tcp](https://docs.rs/fake-tcp).
+Original project by Datong Sun ([dndx/phantun](https://github.com/dndx/phantun)), dual-licensed under
+MIT or Apache-2.0. This fork is distributed under the [MIT license](LICENSE-MIT).
 
-## Performance
-
-Performance was tested on 2 AWS `t4g.xlarge` instances with 4 vCPUs and 5 Gb/s NIC over LAN. `nftables` was used to redirect
-UDP stream of `iperf3` to go through the Phantun/udp2raw tunnel between two test instances and MTU has been tuned to avoid fragmentation.
-
-Phantun `v0.3.2` and `udp2raw_arm_asm_aes` `20200818.0` were used. These were the latest releases of both projects as of Apr 2022.
-
-Test command: `iperf3 -c <IP> -p <PORT> -R -u -l 1400 -b 1000m -t 30 -P 5`
-
-| Mode                                                                            | Send Speed     | Receive Speed  | Overall CPU Usage                                   |
-|---------------------------------------------------------------------------------|----------------|----------------|-----------------------------------------------------|
-| Direct (1 stream)                                                               | 3.00 Gbits/sec | 2.37 Gbits/sec | 25% (1 core at 100%)                                |
-| Phantun (1 stream)                                                              | 1.30 Gbits/sec | 1.20 Gbits/sec | 60% (1 core at 100%, 3 cores at 50%)                |
-| udp2raw (`cipher-mode=none` `auth-mode=none` `disable-anti-replay`) (1 stream)  | 1.30 Gbits/sec | 715 Mbits/sec  | 40% (1 core at 100%, 1 core at 50%, 2 cores idling) |
-| Direct connection (5 streams)                                                   | 5.00 Gbits/sec | 3.64 Gbits/sec | 25% (1 core at 100%)                                |
-| Phantun (5 streams)                                                             | 5.00 Gbits/sec | 2.38 Gbits/sec | 95% (all cores utilized)                            |
-| udp2raw (`cipher-mode=none` `auth-mode=none` `disable-anti-replay`) (5 streams) | 5.00 Gbits/sec | 770 Mbits/sec  | 50% (2 cores at 100%)                               |
-
-Writeup on some of the techniques used in Phantun to achieve this performance result: [Writing Highly Efficient UDP Server in Rust](https://idndx.com/writing-highly-efficient-udp-server-in-rust/).
-
-[Back to TOC](#table-of-contents)
-
-## Future plans
-
-* Load balancing a single UDP stream into multiple TCP streams
-* Integration tests
-
-## Comparison to udp2raw
-
-[udp2raw](https://github.com/wangyu-/udp2raw-tunnel) is another popular project by [@wangyu-](https://github.com/wangyu-)
-that is very similar to what Phantun can do. In fact I took inspirations of Phantun from udp2raw. The biggest reason for
-developing Phantun is because of lack of performance when running udp2raw (especially on multi-core systems such as Raspberry Pi).
-However, the goal is never to be as feature complete as udp2raw and only support the most common use cases. Most notably, UDP over ICMP
-and UDP over UDP mode are not supported and there is no anti-replay nor encryption support. The benefit of this is much better
-performance overall and less MTU overhead because of the lack of additional headers inside the TCP payload.
-
-Here is a quick overview of comparison between those two to help you choose:
-
-|                                                  |    Phantun    |      udp2raw      |
-|--------------------------------------------------|:-------------:|:-----------------:|
-| UDP over FakeTCP obfuscation                     |       ✅       |         ✅         |
-| UDP over ICMP obfuscation                        |       ❌       |         ✅         |
-| UDP over UDP obfuscation                         |       ❌       |         ✅         |
-| Multi-threaded                                   |       ✅       |         ❌         |
-| Throughput                                       |     Better    |        Good       |
-| Layer 3 mode                                     | TUN interface | Raw sockets + BPF |
-| Tunneling MTU overhead                           |    12 bytes   |      44 bytes     |
-| Separate TCP connections for each UDP connection | Client/Server |    Server only    |
-| Anti-replay, encryption                          |       ❌       |         ✅         |
-| IPv6                                             |       ✅       |         ✅         |
-
-[Back to TOC](#table-of-contents)
-
-## License
-
-Copyright 2021-2025 Datong Sun (dndx@idndx.com)
-
-Licensed under the Apache License, Version 2.0 <[LICENSE-APACHE](LICENSE-APACHE) or
-[https://www.apache.org/licenses/LICENSE-2.0](https://www.apache.org/licenses/LICENSE-2.0)> or the MIT license
-<[LICENSE-MIT](LICENSE-MIT) or [https://opensource.org/licenses/MIT](https://opensource.org/licenses/MIT)>, at your
-option. Files in the project may not be
-copied, modified, or distributed except according to those terms.
-
-**[⬆ Back to top](#phantun)**
+**[⬆ Back to top](#phantun-mod)**
