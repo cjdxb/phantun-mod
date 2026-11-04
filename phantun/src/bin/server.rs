@@ -1,15 +1,16 @@
-use clap::{crate_version, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
 use phantun::firewall::{Firewall, Nat};
 use phantun::http;
+use phantun::ssh;
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, shutdown_signal};
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio::time;
@@ -100,8 +101,8 @@ async fn main() -> io::Result<()> {
                 .required(false)
                 .value_name("PATH")
                 .help("Specify a file, which, after TCP handshake, its content will be sent as the \
-                      first data packet to the client. With --http-handshake, the packet is sent \
-                      after the HTTP response instead.\n\
+                      first data packet to the client. With --http-handshake or --ssh-handshake, the packet is sent \
+                      after that handshake response instead.\n\
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
@@ -140,6 +141,16 @@ async fn main() -> io::Result<()> {
                        back in its own HTTP response. No retransmission. The client must also be \
                        started with --http-payload")
                 .action(ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("ssh_handshake")
+                .long("ssh-handshake")
+                .required(false)
+                .help("Open every connection like an SSH server: send an SSH identification string at once, \
+                       and answer the identification string of a Phantun Client started with --ssh-handshake \
+                       with an SSH KEXINIT packet. Connections sending other data first are closed")
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["http_handshake", "http_payload"])
         )
         .get_matches();
 
@@ -188,6 +199,7 @@ async fn main() -> io::Result<()> {
         .transpose()?
         .map(Arc::<[u8]>::from);
     let http_handshake = matches.get_flag("http_handshake");
+    let ssh_handshake = matches.get_flag("ssh_handshake");
     let http_payload = matches.get_flag("http_payload");
 
     let num_cpus = num_cpus::get();
@@ -232,6 +244,9 @@ async fn main() -> io::Result<()> {
     if http_handshake {
         info!("HTTP handshake enabled");
     }
+    if ssh_handshake {
+        info!("SSH handshake enabled");
+    }
     if http_payload {
         info!("HTTP payload enabled");
     }
@@ -243,9 +258,14 @@ async fn main() -> io::Result<()> {
         loop {
             let sock = Arc::new(stack.accept().await);
             info!("New connection: {}", sock);
-            // With HTTP handshake the client discards every segment until the
-            // response arrives, so this packet is sent by the worker afterwards.
-            if !http_handshake {
+            // like a real SSH server, speak first
+            if ssh_handshake && sock.send(ssh::IDENTIFICATION).await.is_none() {
+                error!("Failed to send SSH identification to remote, closing connection.");
+                continue;
+            }
+            // With an application handshake the client discards every segment
+            // until the response arrives, so this packet is sent by the worker afterwards.
+            if !http_handshake && !ssh_handshake {
                 if let Some(p) = handshake_packet.as_deref() {
                     if send_payload(&sock, http_payload, p).await.is_none() {
                         error!("Failed to send handshake packet to remote, closing connection.");
@@ -258,8 +278,11 @@ async fn main() -> io::Result<()> {
 
             let packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
-            // shared by all workers, any of them may receive the HTTP request
-            let http_done = Arc::new(AtomicBool::new(!http_handshake));
+            // shared by all workers; any of them may receive the handshake message
+            let handshake_done = Arc::new(AtomicBool::new(!http_handshake && !ssh_handshake));
+            // one per connection, so a repeated KEXINIT is byte-identical like a real one
+            let ssh_kexinit: Option<Arc<[u8]>> =
+                ssh_handshake.then(|| ssh::kexinit(ssh::Side::Server).into());
             let udp_sock = UdpSocket::bind(if remote_addr.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -273,8 +296,9 @@ async fn main() -> io::Result<()> {
                 let sock = sock.clone();
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
-                let http_done = http_done.clone();
+                let handshake_done = handshake_done.clone();
                 let handshake_packet = handshake_packet.clone();
+                let ssh_kexinit = ssh_kexinit.clone();
                 let udp_sock = new_udp_reuseport(local_addr);
 
                 tokio::spawn(async move {
@@ -293,15 +317,34 @@ async fn main() -> io::Result<()> {
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
                                     Some(size) => {
-                                        // HTTP handshake (or its retransmission) from client
-                                        if http_handshake && http::is_request(&buf_tcp[..size]) {
+                                        // the client's KEXINIT (or a copy of it) carries
+                                        // nothing we need, whenever it arrives
+                                        if ssh_handshake && ssh::is_kexinit(&buf_tcp[..size]) {
+                                            continue;
+                                        }
+
+                                        // HTTP request or SSH identification (or its
+                                        // retransmission) from client
+                                        let http_hello = http_handshake && http::is_request(&buf_tcp[..size]);
+                                        let ssh_hello = ssh_handshake && ssh::is_identification(&buf_tcp[..size]);
+                                        if http_hello || ssh_hello {
                                             // set before replying: the client sends data only
                                             // after the response, possibly to another worker.
                                             // The handshake packet follows that response. The
                                             // client discards anything it reads before it, and a
                                             // retransmitted request repeats the response only.
-                                            let first = !http_done.swap(true, Ordering::Relaxed);
-                                            if sock.send(http::RESPONSE).await.is_none() {
+                                            // For SSH the response is our KEXINIT; our
+                                            // identification string went out on accept, and a
+                                            // retransmission means the client may have missed
+                                            // either, so it gets both again.
+                                            let first = !handshake_done.swap(true, Ordering::Relaxed);
+                                            let sent = if ssh_hello {
+                                                (first || sock.send(ssh::IDENTIFICATION).await.is_some())
+                                                    && sock.send(ssh_kexinit.as_deref().unwrap()).await.is_some()
+                                            } else {
+                                                sock.send(http::RESPONSE).await.is_some()
+                                            };
+                                            if !sent {
                                                 quit.cancel();
                                                 return;
                                             }
@@ -316,18 +359,26 @@ async fn main() -> io::Result<()> {
                                                 }
                                             }
 
-                                            info!(
-                                                "HTTP handshake with {} done, Host {}",
-                                                sock,
-                                                http::request_host(&buf_tcp[..size])
-                                                    .as_deref()
-                                                    .unwrap_or("<none>")
-                                            );
+                                            if ssh_hello {
+                                                info!("SSH handshake with {} done", sock);
+                                            } else {
+                                                info!(
+                                                    "HTTP handshake with {} done, Host {}",
+                                                    sock,
+                                                    http::request_host(&buf_tcp[..size])
+                                                        .as_deref()
+                                                        .unwrap_or("<none>")
+                                                );
+                                            }
                                             continue;
                                         }
 
-                                        if size > 0 && !http_done.load(Ordering::Relaxed) {
-                                            error!("{} sent data before HTTP handshake, closing connection", sock);
+                                        if size > 0 && !handshake_done.load(Ordering::Relaxed) {
+                                            error!(
+                                                "{} sent data before {} handshake, closing connection",
+                                                sock,
+                                                if ssh_handshake { "SSH" } else { "HTTP" }
+                                            );
                                             quit.cancel();
                                             return;
                                         }
