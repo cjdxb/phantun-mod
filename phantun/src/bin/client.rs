@@ -1,9 +1,10 @@
-use clap::{crate_version, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info};
 use phantun::firewall::{Firewall, Nat};
 use phantun::http;
+use phantun::ssh;
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, shutdown_signal, udp_recv_pktinfo};
 use std::collections::HashMap;
 use std::fs;
@@ -18,8 +19,18 @@ use tokio_util::sync::CancellationToken;
 use phantun::{KEEPALIVE_IDLE, KEEPALIVE_INTERVAL, KEEPALIVE_PROBES, UDP_TTL};
 use rand::Rng;
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
+    let mut firewall = None;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let res = runtime.block_on(run(&mut firewall));
+    // dropping the runtime drops the tasks owning fake TCP sockets, which send
+    // RSTs; do it while the firewall rules that NAT those RSTs still exist
+    drop(runtime);
+    drop(firewall);
+    res
+}
+
+async fn run(firewall: &mut Option<Firewall>) -> io::Result<()> {
     pretty_env_logger::init();
 
     let matches = Command::new("Phantun Client")
@@ -100,7 +111,8 @@ async fn main() -> io::Result<()> {
                 .required(false)
                 .value_name("PATH")
                 .help("Specify a file, which, after TCP handshake, its content will be sent as the \
-                      first data packet to the server.\n\
+                      first data packet to the server. With --http-handshake or --ssh-handshake, \
+                      the packet is sent after that handshake response instead.\n\
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
@@ -174,6 +186,15 @@ async fn main() -> io::Result<()> {
                 .action(ArgAction::SetTrue)
                 .requires("http_host")
         )
+        .arg(
+            Arg::new("ssh_handshake")
+                .long("ssh-handshake")
+                .required(false)
+                .help("After TCP handshake, exchange SSH identification strings and KEXINIT packets with \
+                       the server before forwarding any UDP traffic. The server must also be started with --ssh-handshake")
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["http_handshake", "fake_http", "http_payload"])
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -232,6 +253,7 @@ async fn main() -> io::Result<()> {
     }
     let http_request = http_host.as_deref().map(http::request);
     let http_handshake = matches.get_flag("http_handshake");
+    let ssh_handshake = matches.get_flag("ssh_handshake");
     let http_payload_host: Option<String> = matches
         .get_flag("http_payload")
         .then(|| http_host.clone().unwrap());
@@ -261,7 +283,7 @@ async fn main() -> io::Result<()> {
 
     info!("Created TUN device {}", tun[0].name());
 
-    let _firewall = matches
+    *firewall = matches
         .get_one::<String>("iface")
         .map(|iface| {
             Firewall::setup(
@@ -304,12 +326,16 @@ async fn main() -> io::Result<()> {
             http_host.as_deref().unwrap()
         );
     }
+    if ssh_handshake {
+        info!("SSH handshake enabled");
+    }
 
     let main_loop = tokio::spawn(async move {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
 
         loop {
-            let (size, udp_remote_addr, udp_local_addr) = udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
+            let (size, udp_remote_addr, udp_local_addr) =
+                udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
             // seen UDP packet to listening socket, this means:
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
@@ -339,9 +365,20 @@ async fn main() -> io::Result<()> {
                     http_host.as_deref().unwrap()
                 );
             }
+            if ssh_handshake {
+                if !ssh::client_handshake(&sock).await {
+                    error!("SSH handshake with {} failed, closing connection.", sock);
+                    continue;
+                }
+
+                info!("SSH handshake with {} done", sock);
+            }
 
             if let Some(ref p) = handshake_packet {
-                if send_payload(&sock, http_payload_host.as_deref(), p).await.is_none() {
+                if send_payload(&sock, http_payload_host.as_deref(), p)
+                    .await
+                    .is_none()
+                {
                     error!("Failed to send handshake packet to remote, closing connection.");
                     continue;
                 }
@@ -357,11 +394,13 @@ async fn main() -> io::Result<()> {
                 continue;
             }
 
-            assert!(connections
-                .write()
-                .await
-                .insert(udp_remote_addr, sock.clone())
-                .is_none());
+            assert!(
+                connections
+                    .write()
+                    .await
+                    .insert(udp_remote_addr, sock.clone())
+                    .is_none()
+            );
             debug!("inserted fake TCP socket into connection table");
 
             // spawn "fastpath" UDP socket and task, this will offload main task
@@ -390,10 +429,7 @@ async fn main() -> io::Result<()> {
                     // connect to (<incoming packet src_ip>, <incoming packet src_port>).
                     let bind_addr = match (udp_remote_addr, udp_local_addr) {
                         (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(
-                                udp_local_ipv4,
-                                local_addr.port(),
-                            ))
+                            SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
                         }
                         (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
                             SocketAddr::V6(SocketAddrV6::new(
@@ -404,7 +440,9 @@ async fn main() -> io::Result<()> {
                             ))
                         }
                         (_, _) => {
-                            panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
+                            panic!(
+                                "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
+                            );
                         }
                     };
                     let udp_sock = new_udp_reuseport(bind_addr);
@@ -437,6 +475,14 @@ async fn main() -> io::Result<()> {
                                         // late duplicate of the HTTP handshake response.
                                         // Wrapped UDP responses are also 200s, but they have a body.
                                         if http_handshake && http::is_handshake_response(&buf_tcp[..size]) {
+                                            continue;
+                                        }
+
+                                        // late duplicate of the SSH identification string or KEXINIT
+                                        if ssh_handshake
+                                            && (ssh::is_identification(&buf_tcp[..size])
+                                                || ssh::is_kexinit(&buf_tcp[..size]))
+                                        {
                                             continue;
                                         }
 

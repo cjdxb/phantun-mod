@@ -1,7 +1,7 @@
 # Phantun-mod
 
-基于 [dndx/phantun](https://github.com/dndx/phantun) 的修改版：自动管理防火墙规则、HTTP 伪装、断线检测与自动重连。
-A modified [dndx/phantun](https://github.com/dndx/phantun) with automatic firewall rules, HTTP obfuscation and dead-connection detection.
+基于 [dndx/phantun](https://github.com/dndx/phantun) 的修改版：自动管理防火墙规则、HTTP / SSH 伪装、断线检测与自动重连。
+A modified [dndx/phantun](https://github.com/dndx/phantun) with automatic firewall rules, HTTP / SSH obfuscation and dead-connection detection.
 
 **[中文](#中文) | [English](#english)**
 
@@ -21,6 +21,7 @@ A modified [dndx/phantun](https://github.com/dndx/phantun) with automatic firewa
 * [功能详解](#功能详解)
     * [自动管理防火墙规则（--iface）](#自动管理防火墙规则--iface)
     * [HTTP 伪装（--fake-http / --http-handshake / --http-payload）](#http-伪装--fake-http----http-handshake----http-payload)
+    * [SSH 握手（--ssh-handshake）](#ssh-握手--ssh-handshake)
     * [断线检测与自动重连](#断线检测与自动重连)
 * [注意事项](#注意事项)
 * [许可证与致谢](#许可证与致谢)
@@ -45,6 +46,7 @@ udp2raw 的对比请参阅[原版 README](https://github.com/dndx/phantun#readme
 | HTTP 诱饵包 | 仅客户端 | `--fake-http`、`--fake-ttl`、`--fake-repeat`、`--http-host` | 握手时发送只能存活几跳的 HTTP 请求包，让路径上的检测设备看到 HTTP |
 | HTTP 握手 | 两端都要开启 | `--http-handshake`、`--http-host` | TCP 握手后先交换一对真实的 HTTP 请求/响应，再开始转发 UDP |
 | HTTP 逐包包装 | 两端都要开启 | `--http-payload`、`--http-host`（仅客户端） | 每个 UDP 载荷单独放进一条完整的 HTTP 消息，不重传 |
+| SSH 握手 | 两端都要开启 | `--ssh-handshake` | TCP 握手后按真实 SSH 的顺序交换标识串和 KEXINIT，再开始转发 UDP。不能与 HTTP 伪装同时使用 |
 | Keepalive 断线检测 | 客户端发起，服务端应答 | 无（自动生效） | 客户端长时间收不到服务端数据时发送探测包，无应答则关闭连接，由下一个 UDP 包重新建连 |
 | 优雅退出 | 客户端、服务端 | 无 | 收到 `SIGINT` / `SIGTERM` 时正常退出（用于清理防火墙规则） |
 
@@ -65,7 +67,7 @@ sudo install target/release/client /usr/local/bin/phantun_client
 sudo install target/release/server /usr/local/bin/phantun_server
 ```
 
-> **客户端和服务端都必须使用本修改版。** 原版服务端不会应答 keepalive 探测包，也不认识 HTTP 握手。
+> **客户端和服务端都必须使用本修改版。** 原版服务端不会应答 keepalive 探测包，也不认识 HTTP / SSH 握手。
 
 ## 快速开始
 
@@ -93,6 +95,16 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
     --http-host www.example.com --fake-http --http-handshake
 ```
 
+**开启 SSH 握手**：
+
+```bash
+# 服务端
+RUST_LOG=info phantun_server --local 4567 --remote 127.0.0.1:1234 --iface eth0 --ssh-handshake
+
+# 客户端
+RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --iface eth0 --ssh-handshake
+```
+
 不使用 `--iface` 时，需要像原版一样手动开启 IP 转发并配置 NAT 规则，见[原版 README 的 Usage 一节](https://github.com/dndx/phantun#usage)。
 这种情况下可以用 `setcap cap_net_admin=+pe` 以非 root 用户运行。
 
@@ -114,7 +126,7 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 | `--tun-local6 <IP>` | `fcc8::1` | TUN 接口本机端 IPv6 地址 |
 | `--tun-peer6 <IP>` | `fcc8::2` | TUN 接口对端 IPv6 地址 |
 | `-4, --ipv4-only` | 关 | 解析 `--remote` 时只用 IPv4 地址；不能与 `--tun-local6` / `--tun-peer6` 同用 |
-| `--handshake-packet <文件>` | 无 | TCP 握手后把该文件内容作为第一个数据包发给服务端（单包发送，不能超过 MTU） |
+| `--handshake-packet <文件>` | 无 | TCP 握手后把该文件内容作为第一个数据包发给服务端（单包发送，不能超过 MTU）。同时开启 `--http-handshake` 或 `--ssh-handshake` 时，改为在该握手完成之后发送 |
 | ★ `--iface <网卡>` | 无 | 面向互联网的网卡。指定后自动开启 IP 转发、添加 MASQUERADE 规则，退出时删除。需要 root |
 | ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | 防火墙后端，`auto` 表示有 `nft` 命令就用 nft。必须配合 `--iface` |
 | ★ `--http-host <主机名>` | 无 | HTTP 请求中的 `Host` 头，`--fake-http`、`--http-handshake` 和 `--http-payload` 都需要它 |
@@ -123,6 +135,7 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 | ★ `--fake-repeat <N>` | `2` | 每个连接发送的诱饵包数量 |
 | ★ `--http-handshake` | 关 | TCP 握手后与服务端交换真实的 HTTP 请求/响应，再转发 UDP。服务端也必须开启。需要 `--http-host` |
 | ★ `--http-payload` | 关 | 每个 UDP 载荷单独放进一条 HTTP `POST`。服务端也必须开启。需要 `--http-host` |
+| ★ `--ssh-handshake` | 关 | TCP 握手后与服务端交换 SSH 标识串和 KEXINIT，再转发 UDP。服务端也必须开启。不能与 `--fake-http`、`--http-handshake`、`--http-payload` 同用 |
 
 ### 服务端 phantun_server
 
@@ -136,11 +149,12 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 | `--tun-local6 <IP>` | `fcc9::1` | TUN 接口本机端 IPv6 地址 |
 | `--tun-peer6 <IP>` | `fcc9::2` | TUN 接口对端 IPv6 地址，即 IPv6 DNAT 的目标地址 |
 | `-4, --ipv4-only` | 关 | 不给 TUN 接口分配 IPv6 地址（`--iface` 也只添加 IPv4 规则） |
-| `--handshake-packet <文件>` | 无 | TCP 握手后把该文件内容作为第一个数据包发给客户端。同时开启 `--http-handshake` 时，改为在 HTTP 响应之后发送 |
+| `--handshake-packet <文件>` | 无 | TCP 握手后把该文件内容作为第一个数据包发给客户端。同时开启 `--http-handshake` 或 `--ssh-handshake` 时，改为在该握手响应之后发送 |
 | ★ `--iface <网卡>` | 无 | 面向互联网的网卡。指定后自动开启 IP 转发、添加 DNAT 规则，退出时删除。需要 root |
 | ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | 同客户端 |
 | ★ `--http-handshake` | 关 | 要求每个连接先发来开启了 `--http-handshake` 的客户端的 HTTP 请求，并用 HTTP 响应回答。先发其他数据的连接会被关闭 |
 | ★ `--http-payload` | 关 | 只接受放在 HTTP `POST` 里的 UDP 载荷，并且把发出的 UDP 载荷放进 HTTP 响应。客户端也必须开启 |
+| ★ `--ssh-handshake` | 关 | 每个连接建立后立即发送 SSH 标识串，收到开启了 `--ssh-handshake` 的客户端的标识串后回 KEXINIT。先发其他数据的连接会被关闭。不能与 `--http-handshake`、`--http-payload` 同用 |
 
 ## 功能详解
 
@@ -151,7 +165,8 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 1. 把 `/proc/sys/net/ipv4/ip_forward` 置为 1（使用 IPv6 时还会设置 `net.ipv6.conf.all.forwarding`）；
 2. 添加 NAT 规则：
     * 客户端：从 TUN 进、从 `--iface` 出的流量做 MASQUERADE；
-    * 服务端：从 `--iface` 进、目标端口为 `--local` 的 TCP 流量 DNAT 到 `--tun-peer`（及 `--tun-peer6`）。
+    * 服务端：从 `--iface` 进、目标端口为 `--local` 的 TCP 流量 DNAT 到 `--tun-peer`（及 `--tun-peer6`）；
+3. 添加丢弃规则，防止无法 NAT 的包（例如连接重置时 conntrack 条目已失效的 RST）带着 TUN 地址从 `--iface` 发出。
 
 收到 `SIGINT` / `SIGTERM` 退出时删除这些规则（IP 转发开关保持不变）。如果进程被 `kill -9` 等方式强杀导致规则残留，
 下次启动时会先清理旧规则再添加，不会重复。
@@ -184,6 +199,14 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 **`--http-payload`（两端）**：每个 UDP 载荷仍然是一个 fake TCP 段，段内是一条完整的 HTTP/1.1 消息。客户端发送带 `Host` 和 `Content-Length` 的 `POST`，服务端发送带 `Content-Length` 的 `HTTP/1.1 200 OK`。对端只取出正文再交给 UDP 应用。长度对不上的段直接丢弃，不缓存、不拼到下一段，因此不需要重传。空的 keepalive ACK，以及 `--http-handshake` 那一对 GET / 无正文的 200，都不走这层包装。
 
 > 注意：`--http-payload` 两端必须同时开启或同时关闭。只开一端时，开启的一端会丢掉对端发来的未包装数据；未开启的一端则把整条 HTTP 消息（含头部）原样转发给 UDP 应用，通常会被应用当作无效包丢弃。`Host` 为 `www.example.com`、正文长度是 4 位数时，上行请求头是 128 字节，下行响应头是 105 字节。
+
+### SSH 握手（--ssh-handshake）
+
+**`--ssh-handshake`（两端）**：按真实 OpenSSH 会话的顺序开场。TCP 握手完成后，服务端和客户端各自立即发送 SSH 标识串 `SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5`（Ubuntu 24.04 自带的 OpenSSH）；任一方收到对方的标识串后，回一个 `SSH_MSG_KEXINIT` 包（与该版本一致的 OpenSSH 9.6 默认算法列表，cookie 和填充每次随机）。客户端收到服务端的标识串和 KEXINIT 后才开始转发 UDP。2.5 秒内没收齐，客户端重发标识串，最多 3 次，服务端对每次重发都再回一遍标识串和 KEXINIT；仍失败则放弃该连接。这四段由 Phantun 自己消费，不会转发给 UDP 应用。之后的 UDP 载荷不再包装，线上也不再出现 SSH 报文。
+
+密钥交换停在 KEXINIT：没有真正的密钥协商，也没有加密。只让连接开头看起来像 SSH。不能与 `--fake-http`、`--http-handshake`、`--http-payload` 同时使用。
+
+> 注意：`--ssh-handshake` 两端必须同时开启或同时关闭，并且两端都要是带 KEXINIT 交换的版本。只开客户端会导致握手失败；只开服务端则客户端发来的数据会被拒绝，连接被关闭。应用自己发出的、内容恰好等于标识串，或者格式恰好符合未加密 KEXINIT 包的 UDP 包，也会被当成握手重传吃掉。
 
 ### 断线检测与自动重连
 
@@ -231,6 +254,7 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
 * [Features in detail](#features-in-detail)
     * [Automatic firewall rules (--iface)](#automatic-firewall-rules---iface)
     * [HTTP obfuscation (--fake-http / --http-handshake / --http-payload)](#http-obfuscation---fake-http----http-handshake----http-payload)
+    * [SSH handshake (--ssh-handshake)](#ssh-handshake---ssh-handshake)
     * [Dead connection detection and reconnection](#dead-connection-detection-and-reconnection)
 * [Notes](#notes)
 * [License and credits](#license-and-credits)
@@ -258,6 +282,7 @@ This fork is based on upstream v0.8.1 and addresses three practical pain points:
 | HTTP decoys | Client only | `--fake-http`, `--fake-ttl`, `--fake-repeat`, `--http-host` | Sends HTTP request packets that survive only a few hops during the handshake, so middleboxes see HTTP |
 | HTTP handshake | Both sides | `--http-handshake`, `--http-host` | Exchanges a real HTTP request/response after the TCP handshake, before forwarding UDP |
 | HTTP per-packet wrap | Both sides | `--http-payload`, `--http-host` (client only) | Puts each UDP payload in its own complete HTTP message, with no retransmission |
+| SSH handshake | Both sides | `--ssh-handshake` | Exchanges SSH identification strings and KEXINIT packets in real SSH order after the TCP handshake, before forwarding UDP. Cannot be combined with HTTP obfuscation |
 | Keepalive | Client probes, server answers | None (always on) | When the server has been silent for a while, the client sends probes; if none is answered, the connection is closed and the next UDP packet makes a new one |
 | Graceful shutdown | Client, server | None | Exits cleanly on `SIGINT` / `SIGTERM` (so firewall rules can be removed) |
 
@@ -281,7 +306,7 @@ sudo install target/release/server /usr/local/bin/phantun_server
 ```
 
 > **Both client and server must run this fork.** The upstream server does not answer keepalive
-> probes and does not understand the HTTP handshake.
+> probes and does not understand the HTTP or SSH handshake.
 
 ## Quick start
 
@@ -310,6 +335,16 @@ RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --ifa
     --http-host www.example.com --fake-http --http-handshake
 ```
 
+**With the SSH handshake**:
+
+```bash
+# Server
+RUST_LOG=info phantun_server --local 4567 --remote 127.0.0.1:1234 --iface eth0 --ssh-handshake
+
+# Client
+RUST_LOG=info phantun_client --local 127.0.0.1:1234 --remote 10.0.0.1:4567 --iface eth0 --ssh-handshake
+```
+
 Without `--iface`, turn on IP forwarding and set up the NAT rules by hand as with upstream; see the
 [Usage section of the upstream README](https://github.com/dndx/phantun#usage). In that case Phantun
 can run as a non-root user with `setcap cap_net_admin=+pe`.
@@ -332,7 +367,7 @@ Options marked with ★ are new in this fork. Run with `-h` to list all options.
 | `--tun-local6 <IP>` | `fcc8::1` | IPv6 address of the OS end of the TUN interface |
 | `--tun-peer6 <IP>` | `fcc8::2` | IPv6 address of the Phantun end of the TUN interface |
 | `-4, --ipv4-only` | Off | Use only IPv4 addresses when resolving `--remote`; cannot be used with `--tun-local6` / `--tun-peer6` |
-| `--handshake-packet <FILE>` | None | After the TCP handshake, send the content of this file to the server as the first data packet (sent as one packet, must fit in the MTU) |
+| `--handshake-packet <FILE>` | None | After the TCP handshake, send the content of this file to the server as the first data packet (sent as one packet, must fit in the MTU). With `--http-handshake` or `--ssh-handshake`, send it after that handshake |
 | ★ `--iface <IFACE>` | None | Internet facing interface. When set, enables IP forwarding and adds MASQUERADE rules, removed on exit. Requires root |
 | ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | Firewall backend; `auto` uses nft when the `nft` command is available. Requires `--iface` |
 | ★ `--http-host <HOST>` | None | `Host` header of the HTTP request, required by `--fake-http`, `--http-handshake` and `--http-payload` |
@@ -341,6 +376,7 @@ Options marked with ★ are new in this fork. Run with `-h` to list all options.
 | ★ `--fake-repeat <N>` | `2` | Number of decoys sent per connection |
 | ★ `--http-handshake` | Off | After the TCP handshake, exchange a real HTTP request/response with the server before forwarding UDP. The server must enable it too. Requires `--http-host` |
 | ★ `--http-payload` | Off | Send each UDP payload in its own HTTP `POST`. The server must enable it too. Requires `--http-host` |
+| ★ `--ssh-handshake` | Off | After the TCP handshake, exchange SSH identification strings and KEXINIT packets with the server before forwarding UDP. The server must enable it too. Cannot be combined with `--fake-http`, `--http-handshake`, or `--http-payload` |
 
 ### Server: phantun_server
 
@@ -354,11 +390,12 @@ Options marked with ★ are new in this fork. Run with `-h` to list all options.
 | `--tun-local6 <IP>` | `fcc9::1` | IPv6 address of the OS end of the TUN interface |
 | `--tun-peer6 <IP>` | `fcc9::2` | IPv6 address of the Phantun end of the TUN interface, i.e. the IPv6 DNAT target |
 | `-4, --ipv4-only` | Off | Do not assign IPv6 addresses to the TUN interface (`--iface` then adds IPv4 rules only) |
-| `--handshake-packet <FILE>` | None | After the TCP handshake, send the content of this file to the client as the first data packet. With `--http-handshake`, send it after the HTTP response |
+| `--handshake-packet <FILE>` | None | After the TCP handshake, send the content of this file to the client as the first data packet. With `--http-handshake` or `--ssh-handshake`, send it after that handshake response |
 | ★ `--iface <IFACE>` | None | Internet facing interface. When set, enables IP forwarding and adds DNAT rules, removed on exit. Requires root |
 | ★ `--fw-backend <auto\|nft\|iptables>` | `auto` | Same as the client |
 | ★ `--http-handshake` | Off | Require every connection to start with the HTTP request from a client started with `--http-handshake`, and answer it with an HTTP response. Connections sending other data first are closed |
 | ★ `--http-payload` | Off | Accept UDP payloads only inside HTTP `POST` requests, and send each UDP payload inside an HTTP response. The client must enable it too |
+| ★ `--ssh-handshake` | Off | Send an SSH identification string as soon as a connection is accepted, and answer the identification string of a client started with `--ssh-handshake` with a KEXINIT packet. Connections sending other data first are closed. Cannot be combined with `--http-handshake` or `--http-payload` |
 
 ## Features in detail
 
@@ -370,7 +407,9 @@ With `--iface`, Phantun does the following on startup:
 2. Adds NAT rules:
     * Client: MASQUERADE traffic coming from the TUN interface and leaving through `--iface`;
     * Server: DNAT TCP traffic arriving on `--iface` with destination port `--local` to `--tun-peer`
-      (and `--tun-peer6`).
+      (and `--tun-peer6`);
+3. Adds drop rules so packets NAT cannot translate (e.g. a RST sent after its conntrack entry is
+   gone) never leave `--iface` with the TUN address as source.
 
 The rules are removed when Phantun exits on `SIGINT` / `SIGTERM` (IP forwarding is left on). If the
 process was killed (e.g. `kill -9`) and left rules behind, they are cleaned up on the next start
@@ -418,6 +457,28 @@ are not wrapped.
 > message, headers included, to the UDP application, which usually rejects it as invalid. With `Host: www.example.com` and a
 > 4-digit body length, the upload request header is 128 bytes and the download response header is
 > 105 bytes.
+
+### SSH handshake (--ssh-handshake)
+
+**`--ssh-handshake` (both sides)**: the connection opens in the same order as a real OpenSSH session.
+Right after the TCP handshake, the server and the client each send the SSH identification string
+`SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5` (the stock OpenSSH of Ubuntu 24.04). Each side that receives the peer's identification string answers with an
+`SSH_MSG_KEXINIT` packet (the default OpenSSH 9.6 algorithm lists matching that version, random cookie and padding). UDP forwarding
+starts once the client has the server's identification string and KEXINIT. If they do not arrive
+within 2.5 seconds, the client sends its identification string again, up to 3 times, and the
+server answers each copy with its identification string and KEXINIT; after that the client gives
+up on the connection. These four messages are consumed by Phantun and never forwarded to the UDP
+application. Later UDP payloads are not wrapped, and no further SSH messages appear on the wire.
+
+The key exchange stops after KEXINIT: there is no key agreement and no encryption. Only the start
+of the connection looks like SSH. This option cannot be combined with `--fake-http`,
+`--http-handshake`, or `--http-payload`.
+
+> Note: `--ssh-handshake` must be enabled or disabled on both sides, and both sides must run a
+> version with the KEXINIT exchange. Enabling it only on the client makes the handshake fail;
+> enabling it only on the server rejects the client's data and closes the connection. A UDP
+> datagram whose bytes are exactly the identification string, or are shaped exactly like an
+> unencrypted KEXINIT packet, is also consumed as a retransmitted handshake message.
 
 ### Dead connection detection and reconnection
 
