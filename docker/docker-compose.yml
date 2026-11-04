@@ -1,9 +1,9 @@
 version: '3.9'
 
 services:
-  phantun-server:
+  phantun_server:
     image: phantun
-    container_name: phantun-server
+    container_name: phantun_server
     restart: unless-stopped
     network_mode: host
     privileged: true
@@ -11,11 +11,11 @@ services:
       USE_IPTABLES_NFT_BACKEND: 0
       RUST_LOG: INFO
     command: >
-      phantun-server --local 1985 --remote 127.0.0.1:1984 --ipv4-only
+      phantun_server --local 1985 --remote 127.0.0.1:1984 --ipv4-only
 
-  phantun-client:
+  phantun_client:
     image: phantun
-    container_name: phantun-client
+    container_name: phantun_client
     restart: unless-stopped
     network_mode: host
     privileged: true
@@ -23,4 +23,4 @@ services:
       USE_IPTABLES_NFT_BACKEND: 0
       RUST_LOG: INFO
     command: >
-      phantun-client --local 127.0.0.1:1984 --remote 11.22.33.44:1985 --ipv4-only
+      phantun_client --local 127.0.0.1:1984 --remote 11.22.33.44:1985 --ipv4-only
